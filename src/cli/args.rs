@@ -53,7 +53,7 @@ pub enum Command {
     Env,
 }
 
-#[derive(Args)]
+#[derive(Args, Clone)]
 pub struct CopyArgs {
     pub source: String,
     pub destination: String,
@@ -107,6 +107,13 @@ pub struct CopyArgs {
         help = "Process only this shard of the workload (INDEX/COUNT, e.g. 0/8). Run N invocations with different indices for multi-process throughput."
     )]
     pub shard: Option<(usize, usize)>,
+
+    #[arg(
+        long,
+        default_value_t = 1,
+        help = "Spawn N independent tokio runtimes (each with its own connection pool + shard). Single-process alternative to external --shard."
+    )]
+    pub workers: usize,
 }
 
 #[derive(Args)]

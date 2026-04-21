@@ -77,7 +77,7 @@ azcp copy ./src https://acct.blob.core.windows.net/ctr/backup/ \
   --recursive --include-pattern '*.rs' --exclude-pattern 'target/*'
 ```
 
-Flags: `--recursive`, `--no-overwrite`, `--block-size`, `--concurrency`, `--parallel-files`, `--shard`, `--max-retries`, `--dry-run`, `--check-md5`, `--include-pattern`, `--exclude-pattern`, `--progress`.
+Flags: `--recursive`, `--no-overwrite`, `--block-size`, `--concurrency`, `--parallel-files`, `--workers`, `--shard`, `--max-retries`, `--dry-run`, `--check-md5`, `--include-pattern`, `--exclude-pattern`, `--progress`.
 
 ### Throughput tuning
 
@@ -88,10 +88,24 @@ Two independent knobs control parallelism within a single process:
 
 Raising `--parallel-files` lets multiple files dispatch their chunks concurrently rather than sequentially, which significantly improves download throughput on small file counts. For 16 large files at 100 GbE, `--parallel-files 16 --concurrency 128 --block-size 33554432` is a good starting point.
 
-A single `azcp` process saturates around 28-29 Gbps on download due to distributed CPU cost across hyper/TLS/tokio (profile-driven; no single hotspot > 15%). To go higher, shard the workload across multiple processes:
+A single `azcp` process saturates around 28-29 Gbps on download due to distributed CPU cost across hyper/TLS/tokio (profile-driven; no single hotspot > 15%). To go higher, run multiple independent tokio runtimes in one process with `--workers N`:
 
 ```bash
-# 4 shards, 16 files → each process handles 4 files, ~57 Gbps aggregate
+# Single invocation, 4 in-process workers → ~52 Gbps on 16 × 2 GiB files
+azcp copy https://acct.blob.core.windows.net/ctr/prefix/ ./dst/ \
+  --recursive --workers 4 --concurrency 32 --parallel-files 4 \
+  --block-size 16777216
+```
+
+Each worker gets its own tokio runtime, reqwest connection pool, and shard of the
+file list (workers auto-shard by `INDEX/COUNT`). This recaptures ~90% of the
+multi-process throughput (57 Gbps) without external orchestration.
+
+If you need to shard across multiple *nodes* (not just runtimes), use
+`--shard INDEX/COUNT` instead:
+
+```bash
+# 4 external processes, one per node, ~57 Gbps aggregate
 for i in 0 1 2 3; do
   azcp copy https://acct.blob.core.windows.net/ctr/prefix/ ./dst$i/ \
     --recursive --shard $i/4 --concurrency 32 --parallel-files 4 \
@@ -100,7 +114,8 @@ done
 wait
 ```
 
-`--shard INDEX/COUNT` deterministically partitions files (sorted by name, every Nth entry) so shards never overlap. Works on both upload and download.
+Both flags partition files deterministically (sorted by name, every Nth entry) so
+shards never overlap. `--workers` and `--shard` work on both upload and download.
 
 ### Throttling and retries
 
