@@ -182,7 +182,11 @@ async fn needs_upload(
             }
             let local_mtime = local.modified.and_then(system_time_to_utc);
             match (local_mtime, r.last_modified) {
-                (Some(lm), Some(rm)) => Ok(lm > rm),
+                // Blob Last-Modified is RFC2822 with 1-second precision, so
+                // compare at whole-second granularity to avoid treating a
+                // freshly-uploaded blob as older than its nanosecond-precise
+                // source file.
+                (Some(lm), Some(rm)) => Ok(lm.timestamp() > rm.timestamp()),
                 _ => Ok(true),
             }
         }

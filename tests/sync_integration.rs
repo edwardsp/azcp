@@ -160,6 +160,24 @@ fn sync_upload_then_rerun_skips() {
     assert_eq!(unchanged, 3, "rerun: {out}");
 }
 
+// Regression for a bug where rerunning sync within the same second as the
+// upload re-uploaded everything: blob Last-Modified is 1s-precise, local
+// mtime is ns-precise, and the comparator mistakenly treated the local
+// file as "newer". Immediate rerun must be a no-op.
+#[test]
+fn sync_immediate_rerun_skips_sub_second_mtime() {
+    let env = skip_unless_configured!("immediate_rerun");
+    let src = make_fixture();
+    let src_path = src.path().to_str().unwrap();
+
+    run_azcp_ok(&["sync", src_path, &env.blob_url()]);
+    let out = run_azcp_ok(&["sync", src_path, &env.blob_url()]);
+    let (planned, uploaded, unchanged) = parse_summary(&out);
+    assert_eq!(planned, 0, "immediate rerun should skip: {out}");
+    assert_eq!(uploaded, 0, "{out}");
+    assert_eq!(unchanged, 3, "{out}");
+}
+
 #[test]
 fn compare_method_size_misses_same_size_change() {
     let env = skip_unless_configured!("size_miss");
