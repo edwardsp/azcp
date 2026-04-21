@@ -18,6 +18,7 @@ pub async fn run(args: &CopyArgs) -> Result<()> {
     let config = TransferConfig {
         block_size: args.block_size,
         concurrency: args.concurrency,
+        parallel_files: args.parallel_files,
         dry_run: args.dry_run,
         overwrite: !args.no_overwrite,
         recursive: args.recursive,

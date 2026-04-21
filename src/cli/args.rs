@@ -57,6 +57,14 @@ pub struct CopyArgs {
 
     #[arg(
         long,
+        env = "AZCP_PARALLEL_FILES",
+        default_value_t = 16,
+        help = "Max files actively transferring concurrently (chunks within each share --concurrency budget)"
+    )]
+    pub parallel_files: usize,
+
+    #[arg(
+        long,
         env = "AZCP_MAX_RETRIES",
         default_value_t = 5,
         help = "Max retry attempts for throttled (503/429) and transient 5xx responses"
@@ -89,6 +97,14 @@ pub struct SyncArgs {
 
     #[arg(long, default_value_t = 4_194_304)]
     pub block_size: u64,
+
+    #[arg(
+        long,
+        env = "AZCP_PARALLEL_FILES",
+        default_value_t = 16,
+        help = "Max files actively transferring concurrently"
+    )]
+    pub parallel_files: usize,
 
     #[arg(
         long,

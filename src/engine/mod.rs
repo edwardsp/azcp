@@ -28,6 +28,11 @@ pub struct TransferEngine {
     // Held only at the HTTP-request boundary, never at file level, to
     // prevent deadlock when nested operations would exceed the pool size.
     semaphore: Arc<Semaphore>,
+    // Caps how many files are actively being transferred concurrently.
+    // Each file's chunks still share the global `semaphore` budget, but
+    // multiple files race for those permits in parallel - removing the
+    // file-by-file dispatch bottleneck.
+    file_semaphore: Arc<Semaphore>,
 }
 
 #[derive(Debug, Clone)]
@@ -44,12 +49,14 @@ impl TransferEngine {
         let include = build_glob_set(config.include_pattern.as_deref())?;
         let exclude = build_glob_set(config.exclude_pattern.as_deref())?;
         let semaphore = Arc::new(Semaphore::new(config.concurrency));
+        let file_semaphore = Arc::new(Semaphore::new(config.parallel_files.max(1)));
         Ok(Self {
             client: Arc::new(client),
             config,
             include,
             exclude,
             semaphore,
+            file_semaphore,
         })
     }
 
@@ -680,19 +687,28 @@ impl TransferEngine {
 
             let pb = progress.create_file_bar(file_size);
             pb.set_message(relative.clone());
-            let progress_c = progress.clone();
 
-            if file_size == 0 || file_size < block_size {
-                let permit = self.semaphore.clone().acquire_owned().await.unwrap();
-                let client = self.client.clone();
-                let acct = account.to_string();
-                let ctr = container.to_string();
-                let blob_name = blob.name.clone();
-                let pb_c = pb.clone();
-                let local = local_path.clone();
-                let exp = expected_md5.clone();
-                file_tasks.spawn(async move {
+            // File-level admission: bounds concurrent file dispatchers so very
+            // large jobs don't spawn 100k tasks at once. Acquired here in the
+            // outer loop so back-pressure flows back to listing.
+            let file_permit = self.file_semaphore.clone().acquire_owned().await.unwrap();
+
+            let chunk_sem = self.semaphore.clone();
+            let client = self.client.clone();
+            let progress_c = progress.clone();
+            let acct = account.to_string();
+            let ctr = container.to_string();
+            let blob_name = blob.name.clone();
+            let local = local_path.clone();
+            let exp = expected_md5.clone();
+            let pb_c = pb.clone();
+
+            file_tasks.spawn(async move {
+                let _file_permit = file_permit;
+
+                if file_size == 0 || file_size < block_size {
                     let result = async {
+                        let permit = chunk_sem.acquire_owned().await.unwrap();
                         let data = client.get_blob(&acct, &ctr, &blob_name).await?;
                         drop(permit);
                         if check_md5 {
@@ -705,65 +721,59 @@ impl TransferEngine {
                         Ok::<u64, AzcpError>(len)
                     }
                     .await;
-                    match result {
+                    return match result {
                         Ok(_) => {
-                            pb_c.finish_and_clear(); progress_c.complete_file();
+                            pb_c.finish_and_clear();
+                            progress_c.complete_file();
                             Ok(())
                         }
                         Err(e) => {
                             pb_c.finish_and_clear();
                             Err(e)
                         }
-                    }
-                });
-                continue;
-            }
+                    };
+                }
 
-            let file = tokio::fs::File::create(&local_path).await?;
-            file.set_len(file_size).await?;
-            drop(file);
+                let f = tokio::fs::File::create(&local).await?;
+                f.set_len(file_size).await?;
+                drop(f);
 
-            let num_chunks = (file_size + block_size - 1) / block_size;
-            let mut block_handles: Vec<tokio::task::JoinHandle<Result<()>>> =
-                Vec::with_capacity(num_chunks as usize);
+                let num_chunks = (file_size + block_size - 1) / block_size;
+                let mut block_handles: Vec<tokio::task::JoinHandle<Result<()>>> =
+                    Vec::with_capacity(num_chunks as usize);
 
-            for i in 0..num_chunks {
-                let offset = i * block_size;
-                let length = std::cmp::min(block_size, file_size - offset);
+                for i in 0..num_chunks {
+                    let offset = i * block_size;
+                    let length = std::cmp::min(block_size, file_size - offset);
 
-                let permit = self.semaphore.clone().acquire_owned().await.unwrap();
-                let client = self.client.clone();
-                let acct = account.to_string();
-                let ctr = container.to_string();
-                let blob_name = blob.name.clone();
-                let path = local_path.clone();
-                let pb_c = pb.clone();
-                let prog_c = progress.clone();
+                    let permit = chunk_sem.clone().acquire_owned().await.unwrap();
+                    let client_c = client.clone();
+                    let acct_c = acct.clone();
+                    let ctr_c = ctr.clone();
+                    let blob_name_c = blob_name.clone();
+                    let path_c = local.clone();
+                    let pb_c2 = pb_c.clone();
+                    let prog_c2 = progress_c.clone();
 
-                block_handles.push(tokio::spawn(async move {
-                    let _permit = permit;
-                    let data = client
-                        .get_blob_range(&acct, &ctr, &blob_name, offset, length)
-                        .await?;
-                    let mut f = tokio::fs::OpenOptions::new()
-                        .write(true)
-                        .open(&path)
-                        .await?;
-                    f.seek(std::io::SeekFrom::Start(offset)).await?;
-                    f.write_all(&data).await?;
-                    f.flush().await?;
-                    let n = data.len() as u64;
-                    pb_c.inc(n);
-                    prog_c.add_bytes(n);
-                    Ok(())
-                }));
-            }
+                    block_handles.push(tokio::spawn(async move {
+                        let _permit = permit;
+                        let data = client_c
+                            .get_blob_range(&acct_c, &ctr_c, &blob_name_c, offset, length)
+                            .await?;
+                        let mut f = tokio::fs::OpenOptions::new()
+                            .write(true)
+                            .open(&path_c)
+                            .await?;
+                        f.seek(std::io::SeekFrom::Start(offset)).await?;
+                        f.write_all(&data).await?;
+                        f.flush().await?;
+                        let n = data.len() as u64;
+                        pb_c2.inc(n);
+                        prog_c2.add_bytes(n);
+                        Ok(())
+                    }));
+                }
 
-            let pb_c = pb.clone();
-            let blob_name = blob.name.clone();
-            let local = local_path.clone();
-            let exp = expected_md5.clone();
-            file_tasks.spawn(async move {
                 let mut block_err: Option<AzcpError> = None;
                 for h in block_handles {
                     match h.await {
@@ -786,7 +796,8 @@ impl TransferEngine {
                         return Err(e);
                     }
                 }
-                pb_c.finish_and_clear(); progress_c.complete_file();
+                pb_c.finish_and_clear();
+                progress_c.complete_file();
                 Ok(())
             });
         }

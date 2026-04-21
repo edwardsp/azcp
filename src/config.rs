@@ -4,11 +4,13 @@ pub const DEFAULT_BLOCK_SIZE: u64 = 4 * 1024 * 1024;
 pub const MAX_BLOCK_COUNT: u64 = 50_000;
 pub const DEFAULT_CONCURRENCY: usize = 64;
 pub const DEFAULT_MAX_RETRIES: u32 = 5;
+pub const DEFAULT_PARALLEL_FILES: usize = 16;
 pub const API_VERSION: &str = "2024-11-04";
 
 pub struct TransferConfig {
     pub block_size: u64,
     pub concurrency: usize,
+    pub parallel_files: usize,
     pub dry_run: bool,
     pub overwrite: bool,
     pub recursive: bool,
@@ -24,6 +26,7 @@ impl Default for TransferConfig {
         Self {
             block_size: DEFAULT_BLOCK_SIZE,
             concurrency: DEFAULT_CONCURRENCY,
+            parallel_files: DEFAULT_PARALLEL_FILES,
             dry_run: false,
             overwrite: true,
             recursive: false,

@@ -77,7 +77,32 @@ azcp copy ./src https://acct.blob.core.windows.net/ctr/backup/ \
   --recursive --include-pattern '*.rs' --exclude-pattern 'target/*'
 ```
 
-Flags: `--recursive`, `--no-overwrite`, `--block-size`, `--concurrency`, `--dry-run`, `--check-md5`, `--include-pattern`, `--exclude-pattern`, `--progress`.
+Flags: `--recursive`, `--no-overwrite`, `--block-size`, `--concurrency`, `--parallel-files`, `--max-retries`, `--dry-run`, `--check-md5`, `--include-pattern`, `--exclude-pattern`, `--progress`.
+
+### Throughput tuning
+
+Two independent knobs control parallelism:
+
+- `--concurrency N` (default 64): max in-flight HTTP block requests across all files.
+- `--parallel-files N` (default 16, env `AZCP_PARALLEL_FILES`): max files actively transferring at once. Files share the `--concurrency` budget for their chunks.
+
+Raising `--parallel-files` lets multiple files dispatch their chunks concurrently rather than sequentially, which significantly improves download throughput on small file counts. For 16 large files at 100 GbE, `--parallel-files 16 --concurrency 128 --block-size 33554432` is a good starting point.
+
+### Throttling and retries
+
+Every operation retries `503 ServerBusy`, `429 Too Many Requests`, and transient
+`5xx` responses with exponential backoff + jitter (honoring `Retry-After`). The
+retry budget is controlled by `--max-retries` (default 5, env `AZCP_MAX_RETRIES`).
+
+When `--progress` is on, the total bar suffix shows live retry counters, e.g.
+`[retry 503x12 429x2]`, so you can tell at a glance that Azure is pushing
+back. If uploads ultimately fail after exhausting retries, `azcp` exits with
+a non-zero status and prints a `Failed: N` summary.
+
+On very high-bandwidth endpoints you can raise `--concurrency` aggressively,
+but if you see throttle counts climb, Azure is telling you you've hit the
+account ingress limit (typically 60 Gbps for standard storage). Lower
+concurrency or request a quota increase.
 
 ### sync
 
@@ -107,7 +132,7 @@ azcp sync ./local https://acct.blob.core.windows.net/ctr/prefix \
 | `md5` | Content change at same size | Yes (local) |
 | `always` | Everything always re-transferred | No |
 
-**MD5 caveat:** Azure populates `Content-MD5` automatically only for single-shot (small-file) uploads. Large block-list uploads need `--check-md5` on the original `copy` for `--compare-method md5` to have anything to compare against.
+**MD5 caveat:** Azure populates `Content-MD5` automatically only for single-shot (small-file) uploads. Large block-list uploads need `--check-md5` on the original `copy` for `--compare-method md5` to have anything to compare against. If any remote blob lacks `Content-MD5`, `sync --compare-method md5` fails fast with an actionable error listing the offending blobs.
 
 Sync works in both directions: swap source and destination to pull blobs down to a local tree.
 
