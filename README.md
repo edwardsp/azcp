@@ -77,16 +77,30 @@ azcp copy ./src https://acct.blob.core.windows.net/ctr/backup/ \
   --recursive --include-pattern '*.rs' --exclude-pattern 'target/*'
 ```
 
-Flags: `--recursive`, `--no-overwrite`, `--block-size`, `--concurrency`, `--parallel-files`, `--max-retries`, `--dry-run`, `--check-md5`, `--include-pattern`, `--exclude-pattern`, `--progress`.
+Flags: `--recursive`, `--no-overwrite`, `--block-size`, `--concurrency`, `--parallel-files`, `--shard`, `--max-retries`, `--dry-run`, `--check-md5`, `--include-pattern`, `--exclude-pattern`, `--progress`.
 
 ### Throughput tuning
 
-Two independent knobs control parallelism:
+Two independent knobs control parallelism within a single process:
 
 - `--concurrency N` (default 64): max in-flight HTTP block requests across all files.
 - `--parallel-files N` (default 16, env `AZCP_PARALLEL_FILES`): max files actively transferring at once. Files share the `--concurrency` budget for their chunks.
 
 Raising `--parallel-files` lets multiple files dispatch their chunks concurrently rather than sequentially, which significantly improves download throughput on small file counts. For 16 large files at 100 GbE, `--parallel-files 16 --concurrency 128 --block-size 33554432` is a good starting point.
+
+A single `azcp` process saturates around 28-29 Gbps on download due to distributed CPU cost across hyper/TLS/tokio (profile-driven; no single hotspot > 15%). To go higher, shard the workload across multiple processes:
+
+```bash
+# 4 shards, 16 files → each process handles 4 files, ~57 Gbps aggregate
+for i in 0 1 2 3; do
+  azcp copy https://acct.blob.core.windows.net/ctr/prefix/ ./dst$i/ \
+    --recursive --shard $i/4 --concurrency 32 --parallel-files 4 \
+    --block-size 16777216 &
+done
+wait
+```
+
+`--shard INDEX/COUNT` deterministically partitions files (sorted by name, every Nth entry) so shards never overlap. Works on both upload and download.
 
 ### Throttling and retries
 

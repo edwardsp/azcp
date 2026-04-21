@@ -27,6 +27,7 @@ pub async fn run(args: &CopyArgs) -> Result<()> {
         check_md5: args.check_md5,
         progress: args.progress,
         max_retries: args.max_retries,
+        shard: args.shard,
     };
 
     match (&source, &dest) {

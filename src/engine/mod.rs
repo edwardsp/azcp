@@ -350,6 +350,7 @@ impl TransferEngine {
     ) -> Result<TransferSummary> {
         let mut files = local::walk_directory(local_dir, self.config.recursive).await?;
         files.retain(|f| self.path_matches(&f.relative_path));
+        apply_shard(&mut files, self.config.shard, |f| f.relative_path.clone());
         self.upload_entries(files, account, container, blob_prefix).await
     }
 
@@ -623,6 +624,7 @@ impl TransferEngine {
                 .trim_start_matches('/');
             self.path_matches(relative)
         });
+        apply_shard(&mut blobs, self.config.shard, |b| b.name.clone());
         self.download_entries(blobs, account, container, blob_prefix, local_dir).await
     }
 
@@ -840,6 +842,23 @@ impl TransferEngine {
     }
 }
 
+fn apply_shard<T, F>(items: &mut Vec<T>, shard: Option<(usize, usize)>, key: F)
+where
+    F: Fn(&T) -> String,
+{
+    let Some((idx, count)) = shard else { return };
+    if count <= 1 {
+        return;
+    }
+    items.sort_by(|a, b| key(a).cmp(&key(b)));
+    let mut i = 0usize;
+    items.retain(|_| {
+        let keep = i % count == idx;
+        i += 1;
+        keep
+    });
+}
+
 pub fn build_glob_set(patterns: Option<&str>) -> Result<Option<GlobSet>> {
     let Some(patterns) = patterns else {
         return Ok(None);
@@ -957,4 +976,37 @@ fn pwrite_all(file: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<
         written += n;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_shard;
+
+    #[test]
+    fn shard_partitions_disjointly() {
+        let names: Vec<String> = ('a'..='p').map(|c| c.to_string()).collect();
+        let mut all_seen: Vec<String> = Vec::new();
+        for i in 0..4 {
+            let mut items = names.clone();
+            apply_shard(&mut items, Some((i, 4)), |s| s.clone());
+            assert_eq!(items.len(), 4);
+            all_seen.extend(items);
+        }
+        all_seen.sort();
+        assert_eq!(all_seen, names);
+    }
+
+    #[test]
+    fn shard_none_is_noop() {
+        let mut items = vec!["b".to_string(), "a".to_string()];
+        apply_shard(&mut items, None, |s| s.clone());
+        assert_eq!(items, vec!["b".to_string(), "a".to_string()]);
+    }
+
+    #[test]
+    fn shard_count_one_is_noop() {
+        let mut items = vec!["b".to_string(), "a".to_string()];
+        apply_shard(&mut items, Some((0, 1)), |s| s.clone());
+        assert_eq!(items.len(), 2);
+    }
 }

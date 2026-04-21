@@ -19,6 +19,7 @@ pub struct TransferConfig {
     pub check_md5: bool,
     pub progress: bool,
     pub max_retries: u32,
+    pub shard: Option<(usize, usize)>,
 }
 
 impl Default for TransferConfig {
@@ -35,6 +36,7 @@ impl Default for TransferConfig {
             check_md5: false,
             progress: false,
             max_retries: DEFAULT_MAX_RETRIES,
+            shard: None,
         }
     }
 }

@@ -53,6 +53,7 @@ fn build_engine(args: &SyncArgs, credential: Credential) -> Result<Arc<TransferE
         exclude_pattern: args.exclude_pattern.clone(),
         progress: args.progress,
         max_retries: args.max_retries,
+        shard: args.shard,
     };
     Ok(Arc::new(TransferEngine::new(client, config)?))
 }

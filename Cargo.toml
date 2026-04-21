@@ -1,6 +1,6 @@
 [package]
 name = "azcp"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 description = "A Rust implementation of Azure Storage data transfer (azcopy)"
 
@@ -26,6 +26,13 @@ dirs = "6"
 humansize = "2"
 globset = "0.4"
 md-5 = "0.10"
+pprof = { version = "0.14", features = ["flamegraph"], optional = true }
+
+[features]
+profile = ["dep:pprof"]
 
 [dev-dependencies]
 tempfile = "3"
+
+[profile.release]
+debug = 1

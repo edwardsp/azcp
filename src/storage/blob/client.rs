@@ -44,10 +44,10 @@ impl BlobClient {
     }
 
     pub fn with_max_retries(credential: Credential, max_retries: u32) -> Result<Self> {
-        // Force HTTP/1.1: HTTP/2 multiplexes all requests onto a single TCP
-        // connection, which caps per-connection receive bandwidth on Azure
-        // Blob (~25 Gbps observed). HTTP/1.1 lets the connection pool open
-        // many parallel TCP connections, each carrying independent traffic.
+        // HTTP/2 multiplexes all requests onto a single TCP connection, which
+        // caps per-connection receive bandwidth on Azure Blob (~25 Gbps
+        // observed). HTTP/1.1 lets the pool spread traffic across many
+        // independent TCP connections.
         let http = Client::builder()
             .pool_max_idle_per_host(512)
             .http1_only()

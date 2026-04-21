@@ -1,5 +1,20 @@
 use clap::{Args, Parser, Subcommand};
 
+pub fn parse_shard(s: &str) -> Result<(usize, usize), String> {
+    let (i, n) = s
+        .split_once('/')
+        .ok_or_else(|| format!("expected INDEX/COUNT, got {s:?}"))?;
+    let i: usize = i.parse().map_err(|_| format!("bad shard index {i:?}"))?;
+    let n: usize = n.parse().map_err(|_| format!("bad shard count {n:?}"))?;
+    if n == 0 {
+        return Err("shard count must be >= 1".into());
+    }
+    if i >= n {
+        return Err(format!("shard index {i} must be < count {n}"));
+    }
+    Ok((i, n))
+}
+
 #[derive(Parser)]
 #[command(
     name = "azcp",
@@ -85,6 +100,13 @@ pub struct CopyArgs {
 
     #[arg(long, help = "Show per-file progress bars with throughput")]
     pub progress: bool,
+
+    #[arg(
+        long,
+        value_parser = parse_shard,
+        help = "Process only this shard of the workload (INDEX/COUNT, e.g. 0/8). Run N invocations with different indices for multi-process throughput."
+    )]
+    pub shard: Option<(usize, usize)>,
 }
 
 #[derive(Args)]
@@ -136,6 +158,13 @@ pub struct SyncArgs {
 
     #[arg(long, help = "Show per-file progress bars with throughput")]
     pub progress: bool,
+
+    #[arg(
+        long,
+        value_parser = parse_shard,
+        help = "Process only this shard of the workload (INDEX/COUNT, e.g. 0/8)."
+    )]
+    pub shard: Option<(usize, usize)>,
 }
 
 #[derive(Copy, Clone, Debug, clap::ValueEnum)]
