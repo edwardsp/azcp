@@ -25,7 +25,7 @@ jobs:
             runner: ubuntu-24.04-arm
             archive: tar.gz
           - target: x86_64-apple-darwin
-            runner: macos-13
+            runner: macos-latest
             archive: tar.gz
           - target: aarch64-apple-darwin
             runner: macos-latest
@@ -54,7 +54,7 @@ jobs:
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Unit + offline tests
-        if: matrix.target != 'aarch64-pc-windows-msvc'
+        if: matrix.target != 'aarch64-pc-windows-msvc' && matrix.target != 'x86_64-apple-darwin'
         run: cargo test --release --locked --target ${{ matrix.target }}
 
       - name: Package (unix)
