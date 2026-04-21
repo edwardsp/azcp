@@ -48,6 +48,7 @@ fn build_engine(args: &SyncArgs, credential: Credential) -> Result<Arc<TransferE
         concurrency: args.concurrency,
         parallel_files: args.parallel_files,
         dry_run: args.dry_run,
+        discard: false,
         check_md5: false,
         include_pattern: args.include_pattern.clone(),
         exclude_pattern: args.exclude_pattern.clone(),

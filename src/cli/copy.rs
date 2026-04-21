@@ -20,6 +20,7 @@ pub async fn run(args: &CopyArgs) -> Result<()> {
         concurrency: args.concurrency,
         parallel_files: args.parallel_files,
         dry_run: args.dry_run,
+        discard: args.discard,
         overwrite: !args.no_overwrite,
         recursive: args.recursive,
         include_pattern: args.include_pattern.clone(),
@@ -31,7 +32,14 @@ pub async fn run(args: &CopyArgs) -> Result<()> {
     };
 
     match (&source, &dest) {
-        (Location::Local(src), Location::AzureBlob(dst)) => upload(src, dst, config).await,
+        (Location::Local(src), Location::AzureBlob(dst)) => {
+            if config.discard {
+                return Err(AzcpError::Transfer(
+                    "--discard is only valid for downloads (blob -> local)".into(),
+                ));
+            }
+            upload(src, dst, config).await
+        }
         (Location::AzureBlob(src), Location::Local(dst)) => download(src, dst, config).await,
         (Location::AzureBlob(_), Location::AzureBlob(_)) => {
             eprintln!("Server-to-server copy not yet implemented.");

@@ -89,6 +89,12 @@ pub struct CopyArgs {
     #[arg(long)]
     pub dry_run: bool,
 
+    #[arg(
+        long,
+        help = "Download bytes from network but discard them (no disk writes). Benchmarks pure network throughput. Download-only."
+    )]
+    pub discard: bool,
+
     #[arg(long)]
     pub check_md5: bool,
 

@@ -241,7 +241,10 @@ impl TransferEngine {
         expected_md5: Option<&str>,
         progress_bar: Option<&indicatif::ProgressBar>,
     ) -> Result<u64> {
-        local::ensure_parent_dir(local_path).await?;
+        let discard = self.config.discard;
+        if !discard {
+            local::ensure_parent_dir(local_path).await?;
+        }
 
         let size = expected_size.unwrap_or(0);
 
@@ -253,7 +256,9 @@ impl TransferEngine {
             if self.config.check_md5 {
                 verify_md5(blob_path, expected_md5, &data)?;
             }
-            tokio::fs::write(local_path, &data).await?;
+            if !discard {
+                tokio::fs::write(local_path, &data).await?;
+            }
             if let Some(pb) = progress_bar {
                 pb.inc(len);
             }
@@ -286,14 +291,17 @@ impl TransferEngine {
     ) -> Result<u64> {
         use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
+        let discard = self.config.discard;
         let block_size = self.config.block_size;
         let num_chunks = (file_size + block_size - 1) / block_size;
 
-        // Pre-allocate the file so workers can write to non-overlapping
-        // ranges in parallel without coordinating on file length.
-        let file = tokio::fs::File::create(local_path).await?;
-        file.set_len(file_size).await?;
-        drop(file);
+        if !discard {
+            // Pre-allocate the file so workers can write to non-overlapping
+            // ranges in parallel without coordinating on file length.
+            let file = tokio::fs::File::create(local_path).await?;
+            file.set_len(file_size).await?;
+            drop(file);
+        }
 
         let mut tasks: JoinSet<Result<()>> = JoinSet::new();
         for i in 0..num_chunks {
@@ -315,13 +323,15 @@ impl TransferEngine {
                     .await?;
                 drop(_permit);
 
-                let mut f = tokio::fs::OpenOptions::new()
-                    .write(true)
-                    .open(&path)
-                    .await?;
-                f.seek(std::io::SeekFrom::Start(offset)).await?;
-                f.write_all(&data).await?;
-                f.flush().await?;
+                if !discard {
+                    let mut f = tokio::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&path)
+                        .await?;
+                    f.seek(std::io::SeekFrom::Start(offset)).await?;
+                    f.write_all(&data).await?;
+                    f.flush().await?;
+                }
 
                 if let Some(pb) = &pb {
                     pb.inc(data.len() as u64);
@@ -334,7 +344,7 @@ impl TransferEngine {
             res.map_err(|e| AzcpError::Transfer(e.to_string()))??;
         }
 
-        if self.config.check_md5 {
+        if self.config.check_md5 && !discard {
             verify_md5_file(blob_path, expected_md5, local_path).await?;
         }
 
@@ -674,6 +684,7 @@ impl TransferEngine {
         let mut file_tasks: JoinSet<(String, Result<()>)> = JoinSet::new();
         let block_size = self.config.block_size;
         let check_md5 = self.config.check_md5;
+        let discard = self.config.discard;
 
         for blob in blobs {
             let relative = blob
@@ -693,7 +704,9 @@ impl TransferEngine {
                 .as_ref()
                 .and_then(|p| p.content_md5.clone());
 
-            local::ensure_parent_dir(&local_path).await?;
+            if !discard {
+                local::ensure_parent_dir(&local_path).await?;
+            }
 
             let pb = progress.create_file_bar(file_size);
             pb.set_message(relative.clone());
@@ -727,7 +740,9 @@ impl TransferEngine {
                                 verify_md5(&blob_name, exp.as_deref(), &data)?;
                             }
                             let len = data.len() as u64;
-                            tokio::fs::write(&local, &data).await?;
+                            if !discard {
+                                tokio::fs::write(&local, &data).await?;
+                            }
                             pb_c.inc(len);
                             progress_c.add_bytes(len);
                             Ok::<u64, AzcpError>(len)
@@ -746,21 +761,25 @@ impl TransferEngine {
                         };
                     }
 
-                    let f = tokio::fs::File::create(&local).await?;
-                    f.set_len(file_size).await?;
-                    drop(f);
+                    let shared_file = if discard {
+                        None
+                    } else {
+                        let f = tokio::fs::File::create(&local).await?;
+                        f.set_len(file_size).await?;
+                        drop(f);
 
-                    // Open file ONCE per blob and share via Arc<std::fs::File>.
-                    // pwrite (write_all_at) is thread-safe at the OS level: many
-                    // chunk tasks can write to disjoint offsets concurrently
-                    // without a Mutex. Eliminates per-block open/seek/flush
-                    // syscalls that were the dominant CPU cost.
-                    let shared_file = Arc::new(
-                        std::fs::OpenOptions::new()
-                            .write(true)
-                            .open(&local)
-                            .map_err(|e| AzcpError::Transfer(e.to_string()))?,
-                    );
+                        // Open file ONCE per blob and share via Arc<std::fs::File>.
+                        // pwrite (write_all_at) is thread-safe at the OS level: many
+                        // chunk tasks can write to disjoint offsets concurrently
+                        // without a Mutex. Eliminates per-block open/seek/flush
+                        // syscalls that were the dominant CPU cost.
+                        Some(Arc::new(
+                            std::fs::OpenOptions::new()
+                                .write(true)
+                                .open(&local)
+                                .map_err(|e| AzcpError::Transfer(e.to_string()))?,
+                        ))
+                    };
 
                     let num_chunks = (file_size + block_size - 1) / block_size;
                     let mut block_handles: Vec<tokio::task::JoinHandle<Result<()>>> =
@@ -785,10 +804,14 @@ impl TransferEngine {
                                 .get_blob_range(&acct_c, &ctr_c, &blob_name_c, offset, length)
                                 .await?;
                             let n = data.len() as u64;
-                            tokio::task::spawn_blocking(move || pwrite_all(&file_c, &data, offset))
+                            if let Some(file_c) = file_c {
+                                tokio::task::spawn_blocking(move || {
+                                    pwrite_all(&file_c, &data, offset)
+                                })
                                 .await
                                 .map_err(|e| AzcpError::Transfer(e.to_string()))?
                                 .map_err(|e| AzcpError::Transfer(e.to_string()))?;
+                            }
                             pb_c2.inc(n);
                             prog_c2.add_bytes(n);
                             Ok(())
@@ -811,7 +834,7 @@ impl TransferEngine {
                         pb_c.finish_and_clear();
                         return Err(e);
                     }
-                    if check_md5 {
+                    if check_md5 && !discard {
                         if let Err(e) = verify_md5_file(&blob_name, exp.as_deref(), &local).await {
                             pb_c.finish_and_clear();
                             return Err(e);
