@@ -40,7 +40,7 @@ pub async fn run(args: &SyncArgs) -> Result<()> {
 }
 
 fn build_engine(args: &SyncArgs, credential: Credential) -> Result<Arc<TransferEngine>> {
-    let client = BlobClient::new(credential)?;
+    let client = BlobClient::with_max_retries(credential, args.max_retries)?;
     let config = TransferConfig {
         recursive: true,
         overwrite: true,
@@ -51,6 +51,7 @@ fn build_engine(args: &SyncArgs, credential: Credential) -> Result<Arc<TransferE
         include_pattern: args.include_pattern.clone(),
         exclude_pattern: args.exclude_pattern.clone(),
         progress: args.progress,
+        max_retries: args.max_retries,
     };
     Ok(Arc::new(TransferEngine::new(client, config)?))
 }
@@ -165,6 +166,38 @@ fn remote_index(blobs: &[BlobItem], prefix: &str) -> HashMap<String, RemoteRecor
         .collect()
 }
 
+fn md5_preflight(
+    local_files: &[LocalEntry],
+    remote_map: &HashMap<String, RemoteRecord>,
+) -> Result<()> {
+    let missing: Vec<&str> = local_files
+        .iter()
+        .filter_map(|f| {
+            let r = remote_map.get(&f.relative_path)?;
+            if r.size > 0 && r.md5_b64.is_none() {
+                Some(f.relative_path.as_str())
+            } else {
+                None
+            }
+        })
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let sample: Vec<String> = missing.iter().take(10).map(|s| s.to_string()).collect();
+    let extra = missing.len().saturating_sub(sample.len());
+    let extra_note = if extra > 0 {
+        format!("\n  ... and {extra} more")
+    } else {
+        String::new()
+    };
+    Err(crate::error::AzcpError::Transfer(format!(
+        "--compare-method md5 requires Content-MD5 on all remote blobs, but {} blob(s) are missing it:\n  - {}{extra_note}\nhint: re-upload these with 'azcp copy --check-md5 ...' to populate Content-MD5, or use --compare-method size-and-mtime",
+        missing.len(),
+        sample.join("\n  - "),
+    )))
+}
+
 async fn needs_upload(
     method: CompareMethod,
     local: &LocalEntry,
@@ -258,6 +291,10 @@ async fn sync_local_to_blob(
     let remote_blobs = glob_filter_blobs(args, remote_blobs, &dest.path)?;
     let remote_map = remote_index(&remote_blobs, &dest.path);
 
+    if matches!(args.compare_method, CompareMethod::Md5) {
+        md5_preflight(&local_files, &remote_map)?;
+    }
+
     // Diff (potentially I/O-heavy for md5 mode) - run in parallel.
     let diff_sem = Arc::new(Semaphore::new(args.concurrency));
     let mut diff_tasks: JoinSet<Result<Option<LocalEntry>>> = JoinSet::new();
@@ -317,6 +354,13 @@ async fn sync_local_to_blob(
         "\nSync complete: {} planned, {} uploaded, {} unchanged",
         to_upload_count, summary.succeeded, skipped
     );
+    if summary.failed > 0 {
+        println!("  Failed:    {}", summary.failed);
+        return Err(crate::error::AzcpError::Transfer(format!(
+            "{} file(s) failed to transfer",
+            summary.failed
+        )));
+    }
     Ok(())
 }
 
@@ -344,6 +388,34 @@ async fn sync_blob_to_local(
         .into_iter()
         .map(|f| (f.relative_path.clone(), f))
         .collect();
+
+    if matches!(args.compare_method, CompareMethod::Md5) {
+        let missing: Vec<&str> = remote_blobs
+            .iter()
+            .filter(|b| {
+                let props = b.properties.as_ref();
+                let size = props.and_then(|p| p.content_length).unwrap_or(0);
+                let md5 = props.and_then(|p| p.content_md5.as_ref());
+                size > 0 && md5.is_none()
+            })
+            .map(|b| b.name.as_str())
+            .collect();
+        if !missing.is_empty() {
+            let sample: Vec<String> =
+                missing.iter().take(10).map(|s| s.to_string()).collect();
+            let extra = missing.len().saturating_sub(sample.len());
+            let extra_note = if extra > 0 {
+                format!("\n  ... and {extra} more")
+            } else {
+                String::new()
+            };
+            return Err(crate::error::AzcpError::Transfer(format!(
+                "--compare-method md5 requires Content-MD5 on all remote blobs, but {} blob(s) are missing it:\n  - {}{extra_note}\nhint: re-upload with 'azcp copy --check-md5 ...' or use --compare-method size-and-mtime",
+                missing.len(),
+                sample.join("\n  - "),
+            )));
+        }
+    }
 
     let diff_sem = Arc::new(Semaphore::new(args.concurrency));
     let mut diff_tasks: JoinSet<Result<Option<BlobItem>>> = JoinSet::new();
@@ -426,6 +498,13 @@ async fn sync_blob_to_local(
         "\nSync complete: {} planned, {} downloaded, {} unchanged",
         to_download_count, summary.succeeded, skipped
     );
+    if summary.failed > 0 {
+        println!("  Failed:    {}", summary.failed);
+        return Err(crate::error::AzcpError::Transfer(format!(
+            "{} file(s) failed to transfer",
+            summary.failed
+        )));
+    }
     Ok(())
 }
 

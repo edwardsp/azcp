@@ -25,6 +25,7 @@ pub async fn run(args: &CopyArgs) -> Result<()> {
         exclude_pattern: args.exclude_pattern.clone(),
         check_md5: args.check_md5,
         progress: args.progress,
+        max_retries: args.max_retries,
     };
 
     match (&source, &dest) {
@@ -41,13 +42,23 @@ pub async fn run(args: &CopyArgs) -> Result<()> {
     }
 }
 
+fn check_summary(s: &TransferSummary) -> Result<()> {
+    if s.failed > 0 {
+        return Err(AzcpError::Transfer(format!(
+            "{} file(s) failed to transfer",
+            s.failed
+        )));
+    }
+    Ok(())
+}
+
 async fn upload(
     source: &str,
     dest: &BlobLocation,
     config: TransferConfig,
 ) -> Result<()> {
     let credential = resolve_credential(dest)?;
-    let client = BlobClient::new(credential)?;
+    let client = BlobClient::with_max_retries(credential, config.max_retries)?;
     let engine = Arc::new(TransferEngine::new(client, config)?);
 
     let src_path = Path::new(source);
@@ -57,6 +68,7 @@ async fn upload(
             .upload_directory(src_path, &dest.account, &dest.container, &dest.path)
             .await?;
         print_summary("Upload", &summary);
+        check_summary(&summary)?;
     } else if src_path.is_file() {
         let blob_path = if dest.path.is_empty() {
             src_path
@@ -69,7 +81,8 @@ async fn upload(
         };
 
         let metadata = std::fs::metadata(src_path)?;
-        let progress = TransferProgress::new(1, metadata.len(), engine.config().progress);
+        let progress = Arc::new(TransferProgress::new(1, metadata.len(), engine.config().progress));
+        progress.attach_retry_stats(engine.client().retry_stats());
         let pb = progress.create_file_bar(metadata.len());
         pb.set_message(blob_path.clone());
 
@@ -109,7 +122,7 @@ async fn download(
     config: TransferConfig,
 ) -> Result<()> {
     let credential = resolve_credential(source)?;
-    let client = BlobClient::new(credential)?;
+    let client = BlobClient::with_max_retries(credential, config.max_retries)?;
     let engine = Arc::new(TransferEngine::new(client, config)?);
 
     let dest_path = Path::new(dest);
@@ -124,6 +137,7 @@ async fn download(
             )
             .await?;
         print_summary("Download", &summary);
+        check_summary(&summary)?;
     } else {
         let file_name = Path::new(&source.path)
             .file_name()
@@ -141,7 +155,8 @@ async fn download(
             .get_blob_properties(&source.account, &source.container, &source.path)
             .await?;
 
-        let progress = TransferProgress::new(1, props.content_length, engine.config().progress);
+        let progress = Arc::new(TransferProgress::new(1, props.content_length, engine.config().progress));
+        progress.attach_retry_stats(engine.client().retry_stats());
         let pb = progress.create_file_bar(props.content_length);
         pb.set_message(source.path.clone());
 

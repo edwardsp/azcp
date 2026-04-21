@@ -52,8 +52,16 @@ pub struct CopyArgs {
     #[arg(long, default_value_t = 4_194_304)]
     pub block_size: u64,
 
-    #[arg(long, default_value_t = 32)]
+    #[arg(long, default_value_t = 64)]
     pub concurrency: usize,
+
+    #[arg(
+        long,
+        env = "AZCP_MAX_RETRIES",
+        default_value_t = 5,
+        help = "Max retry attempts for throttled (503/429) and transient 5xx responses"
+    )]
+    pub max_retries: u32,
 
     #[arg(long)]
     pub dry_run: bool,
@@ -76,11 +84,19 @@ pub struct SyncArgs {
     pub source: String,
     pub destination: String,
 
-    #[arg(long, default_value_t = 32)]
+    #[arg(long, default_value_t = 64)]
     pub concurrency: usize,
 
     #[arg(long, default_value_t = 4_194_304)]
     pub block_size: u64,
+
+    #[arg(
+        long,
+        env = "AZCP_MAX_RETRIES",
+        default_value_t = 5,
+        help = "Max retry attempts for throttled (503/429) and transient 5xx responses"
+    )]
+    pub max_retries: u32,
 
     #[arg(long)]
     pub dry_run: bool,
@@ -139,8 +155,16 @@ pub struct RemoveArgs {
     #[arg(long)]
     pub dry_run: bool,
 
-    #[arg(long, default_value_t = 32)]
+    #[arg(long, default_value_t = 64)]
     pub concurrency: usize,
+
+    #[arg(
+        long,
+        env = "AZCP_MAX_RETRIES",
+        default_value_t = 5,
+        help = "Max retry attempts for throttled (503/429) and transient 5xx responses"
+    )]
+    pub max_retries: u32,
 
     #[arg(long)]
     pub include_pattern: Option<String>,

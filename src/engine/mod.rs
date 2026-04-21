@@ -374,6 +374,7 @@ impl TransferEngine {
             total_bytes,
             self.config.progress,
         ));
+        progress.attach_retry_stats(self.client.retry_stats());
         let mut file_tasks: JoinSet<Result<()>> = JoinSet::new();
         let block_size = self.config.block_size;
         let check_md5 = self.config.check_md5;
@@ -652,6 +653,7 @@ impl TransferEngine {
             total_bytes,
             self.config.progress,
         ));
+        progress.attach_retry_stats(self.client.retry_stats());
         let mut file_tasks: JoinSet<Result<()>> = JoinSet::new();
         let block_size = self.config.block_size;
         let check_md5 = self.config.check_md5;

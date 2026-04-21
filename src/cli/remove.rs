@@ -26,7 +26,7 @@ pub async fn run(args: &RemoveArgs) -> Result<()> {
 
 async fn remove_azure(loc: &BlobLocation, args: &RemoveArgs) -> Result<()> {
     let credential = resolve_credential(loc)?;
-    let client = Arc::new(BlobClient::new(credential)?);
+    let client = Arc::new(BlobClient::with_max_retries(credential, args.max_retries)?);
 
     if loc.path.is_empty() && loc.container.is_empty() {
         eprintln!("Specify a container or blob to delete.");
@@ -155,6 +155,11 @@ async fn remove_azure(loc: &BlobLocation, args: &RemoveArgs) -> Result<()> {
     pb.finish_and_clear();
     println!("\n{deleted} blob(s) deleted, {failed} failed");
 
+    if failed > 0 {
+        return Err(crate::error::AzcpError::Transfer(format!(
+            "{failed} blob deletion(s) failed"
+        )));
+    }
     Ok(())
 }
 

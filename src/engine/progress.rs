@@ -3,12 +3,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::storage::blob::client::RetryStats;
+
 pub struct TransferProgress {
     multi: Arc<MultiProgress>,
     total_bar: ProgressBar,
     total_files: u64,
     files_done: AtomicU64,
     enabled: bool,
+    retry_stats: std::sync::Mutex<Option<Arc<RetryStats>>>,
 }
 
 impl TransferProgress {
@@ -41,7 +44,28 @@ impl TransferProgress {
             total_files,
             files_done: AtomicU64::new(0),
             enabled,
+            retry_stats: std::sync::Mutex::new(None),
         }
+    }
+
+    pub fn attach_retry_stats(self: &Arc<Self>, stats: Arc<RetryStats>) {
+        if !self.enabled {
+            return;
+        }
+        *self.retry_stats.lock().unwrap() = Some(stats.clone());
+        let this = Arc::clone(self);
+        // Refresh the total-bar message every 250ms so throttle counts appear
+        // in near-real-time even during long single-file uploads where
+        // complete_file() is not called.
+        tokio::spawn(async move {
+            loop {
+                if this.total_bar.is_finished() {
+                    break;
+                }
+                this.refresh_message();
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        });
     }
 
     pub fn create_file_bar(&self, size: u64) -> ProgressBar {
@@ -67,18 +91,30 @@ impl TransferProgress {
     }
 
     pub fn complete_file(&self) {
-        let done = self.files_done.fetch_add(1, Ordering::Relaxed) + 1;
-        self.total_bar
-            .set_message(format!("{}/{} files", done, self.total_files));
+        self.files_done.fetch_add(1, Ordering::Relaxed);
+        self.refresh_message();
+    }
+
+    fn refresh_message(&self) {
+        let done = self.files_done.load(Ordering::Relaxed);
+        let base = format!("{}/{} files", done, self.total_files);
+        let stats_suffix: String = self
+            .retry_stats
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|s| format_retry_stats(s.as_ref())))
+            .unwrap_or_default();
+        if stats_suffix.is_empty() {
+            self.total_bar.set_message(base);
+        } else {
+            self.total_bar.set_message(format!("{base} {stats_suffix}"));
+        }
     }
 
     pub fn finish(&self) {
         if self.enabled {
-            self.total_bar.finish_with_message(format!(
-                "{}/{} files",
-                self.files_done.load(Ordering::Relaxed),
-                self.total_files
-            ));
+            self.refresh_message();
+            self.total_bar.finish();
         }
     }
 
@@ -89,4 +125,28 @@ impl TransferProgress {
             println!("{msg}");
         }
     }
+}
+
+fn format_retry_stats(s: &RetryStats) -> String {
+    let t503 = s.throttle_503.load(Ordering::Relaxed);
+    let t429 = s.throttle_429.load(Ordering::Relaxed);
+    let t5xx = s.server_5xx.load(Ordering::Relaxed);
+    let ttx = s.transport_err.load(Ordering::Relaxed);
+    if t503 + t429 + t5xx + ttx == 0 {
+        return String::new();
+    }
+    let mut parts = Vec::new();
+    if t503 > 0 {
+        parts.push(format!("503x{t503}"));
+    }
+    if t429 > 0 {
+        parts.push(format!("429x{t429}"));
+    }
+    if t5xx > 0 {
+        parts.push(format!("5xx×{t5xx}"));
+    }
+    if ttx > 0 {
+        parts.push(format!("net×{ttx}"));
+    }
+    format!("[retry {}]", parts.join(" "))
 }
