@@ -634,8 +634,6 @@ impl TransferEngine {
         blob_prefix: &str,
         local_dir: &Path,
     ) -> Result<TransferSummary> {
-        use tokio::io::{AsyncSeekExt, AsyncWriteExt};
-
         let total_files = blobs.len() as u64;
         let total_bytes: u64 = blobs
             .iter()
@@ -738,6 +736,18 @@ impl TransferEngine {
                 f.set_len(file_size).await?;
                 drop(f);
 
+                // Open file ONCE per blob and share via Arc<std::fs::File>.
+                // pwrite (write_all_at) is thread-safe at the OS level: many
+                // chunk tasks can write to disjoint offsets concurrently
+                // without a Mutex. Eliminates per-block open/seek/flush
+                // syscalls that were the dominant CPU cost.
+                let shared_file = Arc::new(
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&local)
+                        .map_err(|e| AzcpError::Transfer(e.to_string()))?,
+                );
+
                 let num_chunks = (file_size + block_size - 1) / block_size;
                 let mut block_handles: Vec<tokio::task::JoinHandle<Result<()>>> =
                     Vec::with_capacity(num_chunks as usize);
@@ -751,7 +761,7 @@ impl TransferEngine {
                     let acct_c = acct.clone();
                     let ctr_c = ctr.clone();
                     let blob_name_c = blob_name.clone();
-                    let path_c = local.clone();
+                    let file_c = shared_file.clone();
                     let pb_c2 = pb_c.clone();
                     let prog_c2 = progress_c.clone();
 
@@ -760,14 +770,11 @@ impl TransferEngine {
                         let data = client_c
                             .get_blob_range(&acct_c, &ctr_c, &blob_name_c, offset, length)
                             .await?;
-                        let mut f = tokio::fs::OpenOptions::new()
-                            .write(true)
-                            .open(&path_c)
-                            .await?;
-                        f.seek(std::io::SeekFrom::Start(offset)).await?;
-                        f.write_all(&data).await?;
-                        f.flush().await?;
                         let n = data.len() as u64;
+                        tokio::task::spawn_blocking(move || pwrite_all(&file_c, &data, offset))
+                            .await
+                            .map_err(|e| AzcpError::Transfer(e.to_string()))?
+                            .map_err(|e| AzcpError::Transfer(e.to_string()))?;
                         pb_c2.inc(n);
                         prog_c2.add_bytes(n);
                         Ok(())
@@ -927,4 +934,27 @@ fn mime_from_path(path: &Path) -> String {
         _ => "application/octet-stream",
     }
     .to_string()
+}
+
+#[cfg(unix)]
+fn pwrite_all(file: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.write_all_at(buf, offset)
+}
+
+#[cfg(windows)]
+fn pwrite_all(file: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    let mut written = 0;
+    while written < buf.len() {
+        let n = file.seek_write(&buf[written..], offset + written as u64)?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "seek_write returned 0",
+            ));
+        }
+        written += n;
+    }
+    Ok(())
 }
