@@ -1,12 +1,12 @@
 [package]
 name = "azcp"
-version = "0.1.10"
+version = "0.1.11"
 edition = "2021"
 description = "A Rust implementation of Azure Storage data transfer (azcopy)"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "blocking"] }
 clap = { version = "4", features = ["derive", "env"] }
 indicatif = "0.17"
 serde = { version = "1", features = ["derive"] }

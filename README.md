@@ -46,8 +46,10 @@ Requires Rust 1.75+.
 
 1. `AZURE_STORAGE_ACCOUNT` + `AZURE_STORAGE_KEY` — Shared Key
 2. `AZURE_STORAGE_SAS_TOKEN` — SAS
-3. Ambient Azure CLI login (`az login`) — Bearer token via `az account get-access-token`
-4. Anonymous (public containers only)
+3. **AKS workload identity** — when `AZURE_FEDERATED_TOKEN_FILE` + `AZURE_CLIENT_ID` + `AZURE_TENANT_ID` are set (automatic in workload-identity-enabled pods)
+4. **Azure VM managed identity** via IMDS (`169.254.169.254`). If multiple user-assigned identities are attached, set `AZURE_CLIENT_ID` to select one.
+5. Ambient Azure CLI login (`az login`) — account key then Bearer token
+6. Anonymous (public containers only)
 
 Run `azcp env` to see which credential source is active.
 

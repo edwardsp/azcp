@@ -1,4 +1,5 @@
 pub mod az_cli;
+pub mod imds;
 pub mod sas;
 pub mod shared_key;
 
@@ -33,7 +34,19 @@ impl Credential {
             return Ok(Some(cred));
         }
 
-        debug!("no env credentials, trying az CLI account key for {account_name}");
+        match imds::get_storage_token_workload() {
+            Ok(Some(token)) => return Ok(Some(Credential::Bearer { token })),
+            Ok(None) => {}
+            Err(e) => debug!("workload-identity token failed: {e}"),
+        }
+
+        match imds::get_storage_token_imds() {
+            Ok(Some(token)) => return Ok(Some(Credential::Bearer { token })),
+            Ok(None) => {}
+            Err(e) => debug!("IMDS token failed: {e}"),
+        }
+
+        debug!("no ambient identity, trying az CLI account key for {account_name}");
         match az_cli::get_account_key(account_name) {
             Ok(key) => {
                 return Ok(Some(Credential::SharedKey {
