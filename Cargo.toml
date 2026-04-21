@@ -1,6 +1,6 @@
 [package]
 name = "azcp"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 description = "A Rust implementation of Azure Storage data transfer (azcopy)"
 
@@ -27,9 +27,13 @@ humansize = "2"
 globset = "0.4"
 md-5 = "0.10"
 pprof = { version = "0.14", features = ["flamegraph"], optional = true }
+tikv-jemallocator = { version = "0.6", optional = true }
+mimalloc = { version = "0.1", default-features = false, optional = true }
 
 [features]
 profile = ["dep:pprof"]
+jemalloc = ["dep:tikv-jemallocator"]
+mimalloc-allocator = ["dep:mimalloc"]
 
 [dev-dependencies]
 tempfile = "3"

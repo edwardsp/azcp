@@ -117,6 +117,20 @@ wait
 Both flags partition files deterministically (sorted by name, every Nth entry) so
 shards never overlap. `--workers` and `--shard` work on both upload and download.
 
+### Optional: jemalloc / mimalloc
+
+The default glibc allocator is fine. For heavy multi-worker workloads you can
+swap in jemalloc or mimalloc at build time:
+
+```bash
+cargo build --release --features jemalloc
+# or
+cargo build --release --features mimalloc-allocator
+```
+
+Measured on a 128-core GB300 node with `--workers 4` (8 runs each, median Gbps):
+glibc 52.0, mimalloc 52.5, jemalloc 52.9, jemalloc+`MALLOC_CONF=background_thread:true,metadata_thp:auto,narenas:64` peaked at 61 with high variance. The gain is within run-to-run noise for download; upload is untested. Not worth making default — enable if you're tuning for your specific workload.
+
 ### Throttling and retries
 
 Every operation retries `503 ServerBusy`, `429 Too Many Requests`, and transient
