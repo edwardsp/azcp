@@ -1,0 +1,158 @@
+use clap::{Args, Parser, Subcommand};
+
+#[derive(Parser)]
+#[command(
+    name = "azcp",
+    version,
+    about = "Azure Storage data transfer tool (Rust)"
+)]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Command,
+
+    #[arg(long, global = true, default_value = "info")]
+    pub log_level: String,
+}
+
+#[derive(Subcommand)]
+pub enum Command {
+    /// Copy data between local filesystem and Azure Blob Storage
+    Copy(CopyArgs),
+
+    /// Synchronize source and destination, transferring only changed files
+    Sync(SyncArgs),
+
+    /// List containers or blobs
+    #[command(name = "ls", alias = "list")]
+    List(ListArgs),
+
+    /// Remove blobs or containers
+    #[command(name = "rm", alias = "remove")]
+    Remove(RemoveArgs),
+
+    /// Create a container or local directory
+    #[command(name = "mk", alias = "make")]
+    Make(MakeArgs),
+
+    /// Show environment variable configuration
+    Env,
+}
+
+#[derive(Args)]
+pub struct CopyArgs {
+    pub source: String,
+    pub destination: String,
+
+    #[arg(long, short)]
+    pub recursive: bool,
+
+    #[arg(long, help = "Do not overwrite existing destination files")]
+    pub no_overwrite: bool,
+
+    #[arg(long, default_value_t = 4_194_304)]
+    pub block_size: u64,
+
+    #[arg(long, default_value_t = 32)]
+    pub concurrency: usize,
+
+    #[arg(long)]
+    pub dry_run: bool,
+
+    #[arg(long)]
+    pub check_md5: bool,
+
+    #[arg(long)]
+    pub include_pattern: Option<String>,
+
+    #[arg(long)]
+    pub exclude_pattern: Option<String>,
+
+    #[arg(long, help = "Show per-file progress bars with throughput")]
+    pub progress: bool,
+}
+
+#[derive(Args)]
+pub struct SyncArgs {
+    pub source: String,
+    pub destination: String,
+
+    #[arg(long, default_value_t = 32)]
+    pub concurrency: usize,
+
+    #[arg(long, default_value_t = 4_194_304)]
+    pub block_size: u64,
+
+    #[arg(long)]
+    pub dry_run: bool,
+
+    #[arg(long, help = "Delete destination files not present in source")]
+    pub delete_destination: bool,
+
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = CompareMethod::SizeAndMtime,
+        help = "How to decide whether a file needs re-transfer"
+    )]
+    pub compare_method: CompareMethod,
+
+    #[arg(long)]
+    pub include_pattern: Option<String>,
+
+    #[arg(long)]
+    pub exclude_pattern: Option<String>,
+
+    #[arg(long, help = "Show per-file progress bars with throughput")]
+    pub progress: bool,
+}
+
+#[derive(Copy, Clone, Debug, clap::ValueEnum)]
+pub enum CompareMethod {
+    /// Re-transfer if file sizes differ.
+    Size,
+    /// Re-transfer if size differs OR source last-modified > destination last-modified.
+    SizeAndMtime,
+    /// Re-transfer if local MD5 differs from blob's stored content-md5.
+    Md5,
+    /// Re-transfer everything.
+    Always,
+}
+
+#[derive(Args)]
+pub struct ListArgs {
+    pub url: String,
+
+    #[arg(long, short)]
+    pub recursive: bool,
+
+    #[arg(long)]
+    pub machine_readable: bool,
+}
+
+#[derive(Args)]
+pub struct RemoveArgs {
+    pub url: String,
+
+    #[arg(long, short)]
+    pub recursive: bool,
+
+    #[arg(long)]
+    pub dry_run: bool,
+
+    #[arg(long, default_value_t = 32)]
+    pub concurrency: usize,
+
+    #[arg(long)]
+    pub include_pattern: Option<String>,
+
+    #[arg(long)]
+    pub exclude_pattern: Option<String>,
+
+    #[arg(long, help = "Show progress bar with deletion rate")]
+    pub progress: bool,
+}
+
+#[derive(Args)]
+pub struct MakeArgs {
+    pub url: String,
+}
