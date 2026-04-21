@@ -350,7 +350,7 @@ impl TransferEngine {
     ) -> Result<TransferSummary> {
         let mut files = local::walk_directory(local_dir, self.config.recursive).await?;
         files.retain(|f| self.path_matches(&f.relative_path));
-        apply_shard(&mut files, self.config.shard, |f| f.relative_path.clone());
+        apply_shard(&mut files, self.config.shard, |f| f.relative_path.clone(), |f| f.size);
         self.upload_entries(files, account, container, blob_prefix).await
     }
 
@@ -629,7 +629,12 @@ impl TransferEngine {
                 .trim_start_matches('/');
             self.path_matches(relative)
         });
-        apply_shard(&mut blobs, self.config.shard, |b| b.name.clone());
+        apply_shard(
+            &mut blobs,
+            self.config.shard,
+            |b| b.name.clone(),
+            |b| b.properties.as_ref().and_then(|p| p.content_length).unwrap_or(0),
+        );
         self.download_entries(blobs, account, container, blob_prefix, local_dir).await
     }
 
@@ -852,18 +857,43 @@ impl TransferEngine {
     }
 }
 
-fn apply_shard<T, F>(items: &mut Vec<T>, shard: Option<(usize, usize)>, key: F)
+// Size-aware partitioning via Longest-Processing-Time (LPT) bin packing.
+// Each worker independently re-runs the listing and applies this on the full
+// set; determinism (same partition on every worker) requires identical input
+// order and tie-breaking, hence the (size desc, name asc) sort and stable
+// greedy assignment to the lowest-loaded bin.
+fn apply_shard<T, F, S>(items: &mut Vec<T>, shard: Option<(usize, usize)>, name: F, size: S)
 where
     F: Fn(&T) -> String,
+    S: Fn(&T) -> u64,
 {
     let Some((idx, count)) = shard else { return };
     if count <= 1 {
         return;
     }
-    items.sort_by(|a, b| key(a).cmp(&key(b)));
+    let mut indexed: Vec<(usize, u64, String)> = items
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (i, size(t), name(t)))
+        .collect();
+    // Largest first; ties broken by name for cross-worker determinism.
+    indexed.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.2.cmp(&b.2)));
+    let mut bin_loads = vec![0u64; count];
+    let mut owner = vec![0usize; items.len()];
+    for (orig_idx, sz, _) in &indexed {
+        // Pick lowest-loaded bin; ties broken by lowest bin index for determinism.
+        let bin = bin_loads
+            .iter()
+            .enumerate()
+            .min_by(|(ai, al), (bi, bl)| al.cmp(bl).then_with(|| ai.cmp(bi)))
+            .map(|(b, _)| b)
+            .unwrap_or(0);
+        bin_loads[bin] = bin_loads[bin].saturating_add(*sz);
+        owner[*orig_idx] = bin;
+    }
     let mut i = 0usize;
     items.retain(|_| {
-        let keep = i % count == idx;
+        let keep = owner[i] == idx;
         i += 1;
         keep
     });
@@ -998,7 +1028,7 @@ mod tests {
         let mut all_seen: Vec<String> = Vec::new();
         for i in 0..4 {
             let mut items = names.clone();
-            apply_shard(&mut items, Some((i, 4)), |s| s.clone());
+            apply_shard(&mut items, Some((i, 4)), |s| s.clone(), |_| 1);
             assert_eq!(items.len(), 4);
             all_seen.extend(items);
         }
@@ -1009,14 +1039,34 @@ mod tests {
     #[test]
     fn shard_none_is_noop() {
         let mut items = vec!["b".to_string(), "a".to_string()];
-        apply_shard(&mut items, None, |s| s.clone());
+        apply_shard(&mut items, None, |s| s.clone(), |_| 1);
         assert_eq!(items, vec!["b".to_string(), "a".to_string()]);
     }
 
     #[test]
     fn shard_count_one_is_noop() {
         let mut items = vec!["b".to_string(), "a".to_string()];
-        apply_shard(&mut items, Some((0, 1)), |s| s.clone());
+        apply_shard(&mut items, Some((0, 1)), |s| s.clone(), |_| 1);
         assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn shard_balances_by_size_lpt() {
+        let items: Vec<(String, u64)> = vec![
+            ("big1".into(), 100),
+            ("a".into(), 1),
+            ("b".into(), 1),
+            ("c".into(), 1),
+            ("d".into(), 1),
+        ];
+        let mut totals = [0u64; 2];
+        for shard in 0..2 {
+            let mut s = items.clone();
+            apply_shard(&mut s, Some((shard, 2)), |t| t.0.clone(), |t| t.1);
+            totals[shard] = s.iter().map(|t| t.1).sum();
+        }
+        assert_eq!(totals.iter().sum::<u64>(), 104);
+        assert_eq!(*totals.iter().max().unwrap(), 100);
+        assert_eq!(*totals.iter().min().unwrap(), 4);
     }
 }

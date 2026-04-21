@@ -95,7 +95,7 @@ azcp copy https://acct.blob.core.windows.net/ctr/prefix/ ./dst/ \
   --block-size 16777216
 ```
 
-Each worker auto-shards files (sorted by name, every Nth entry) so no overlap.
+Each worker auto-shards files using **size-balanced LPT** (Longest-Processing-Time bin packing): files are sorted by size descending and greedily assigned to the least-loaded worker. For a 385 GiB / 175-file DeepSeek-R1 checkpoint with 3 × 8-9 GiB + 172 × ~2.3 GiB shards, this brings per-worker load spread from 31% (naive round-robin) to 1.3%, eliminating stragglers.
 
 #### Why workers are necessary (not just a tuning knob)
 
