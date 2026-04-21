@@ -70,6 +70,7 @@ async fn upload(
             .upload_directory(src_path, &dest.account, &dest.container, &dest.path)
             .await?;
         print_summary("Upload", &summary);
+        print_retry_stats(engine.client());
         check_summary(&summary)?;
     } else if src_path.is_file() {
         let blob_path = if dest.path.is_empty() {
@@ -139,6 +140,7 @@ async fn download(
             )
             .await?;
         print_summary("Download", &summary);
+        print_retry_stats(engine.client());
         check_summary(&summary)?;
     } else {
         let file_name = Path::new(&source.path)
@@ -211,5 +213,20 @@ fn print_summary(op: &str, s: &TransferSummary) {
     }
     if s.skipped > 0 {
         println!("  Skipped:   {}", s.skipped);
+    }
+}
+
+fn print_retry_stats(client: &BlobClient) {
+    let s = client.retry_stats();
+    let t503 = s.throttle_503.load(std::sync::atomic::Ordering::Relaxed);
+    let t429 = s.throttle_429.load(std::sync::atomic::Ordering::Relaxed);
+    let t5xx = s.server_5xx.load(std::sync::atomic::Ordering::Relaxed);
+    let txerr = s.transport_err.load(std::sync::atomic::Ordering::Relaxed);
+    if t503 + t429 + t5xx + txerr > 0 {
+        println!(
+            "  Retries:   503x{t503} 429x{t429} 5xxx{t5xx} transport-err x{txerr}"
+        );
+    } else {
+        println!("  Retries:   none");
     }
 }

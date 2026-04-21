@@ -81,55 +81,59 @@ Flags: `--recursive`, `--no-overwrite`, `--block-size`, `--concurrency`, `--para
 
 ### Throughput tuning
 
-Two independent knobs control parallelism within a single process:
+Two independent knobs control parallelism:
 
-- `--concurrency N` (default 64): max in-flight HTTP block requests across all files.
-- `--parallel-files N` (default 16, env `AZCP_PARALLEL_FILES`): max files actively transferring at once. Files share the `--concurrency` budget for their chunks.
+- `--workers N` (default 1): spawn N independent tokio runtimes in one process, each with its own `reqwest` connection pool and its own shard of the workload. **Required to scale past ~28 Gbps** — a single tokio runtime + reqwest client tops out there regardless of how many concurrent requests you submit (see "why workers are necessary" below).
+- `--concurrency N` (default 64) and `--parallel-files N` (default 16, env `AZCP_PARALLEL_FILES`): per-runtime limits on in-flight HTTP block requests and actively-transferring files. With `--workers > 1`, these are per-worker.
 
-Raising `--parallel-files` lets multiple files dispatch their chunks concurrently rather than sequentially, which significantly improves download throughput on small file counts. For 16 large files at 100 GbE, `--parallel-files 16 --concurrency 128 --block-size 33554432` is a good starting point.
-
-A single `azcp` process saturates around 28-29 Gbps on download due to distributed CPU cost across hyper/TLS/tokio (profile-driven; no single hotspot > 15%). To go higher, run multiple independent tokio runtimes in one process with `--workers N`:
+For 16+ large files at 100+ GbE, `--workers 4 --concurrency 32 --parallel-files 4 --block-size 16777216` reaches **~64 Gbps** sustained on download; `--workers 8` peaks at **~69 Gbps**.
 
 ```bash
-# Single invocation, 4 in-process workers → ~52 Gbps on 16 × 2 GiB files
+# High-throughput download (320 GiB / 160 files measured at 64 Gbps sustained)
 azcp copy https://acct.blob.core.windows.net/ctr/prefix/ ./dst/ \
   --recursive --workers 4 --concurrency 32 --parallel-files 4 \
   --block-size 16777216
 ```
 
-Each worker gets its own tokio runtime, reqwest connection pool, and shard of the
-file list (workers auto-shard by `INDEX/COUNT`). This recaptures ~90% of the
-multi-process throughput (57 Gbps) without external orchestration.
+Each worker auto-shards files (sorted by name, every Nth entry) so no overlap.
 
-If you need to shard across multiple *nodes* (not just runtimes), use
-`--shard INDEX/COUNT` instead:
+#### Why workers are necessary (not just a tuning knob)
 
-```bash
-# 4 external processes, one per node, ~57 Gbps aggregate
-for i in 0 1 2 3; do
-  azcp copy https://acct.blob.core.windows.net/ctr/prefix/ ./dst$i/ \
-    --recursive --shard $i/4 --concurrency 32 --parallel-files 4 \
-    --block-size 16777216 &
-done
-wait
-```
+A single tokio runtime + single `reqwest::Client` has a hard ceiling around **25-28 Gbps** on Azure Blob downloads, *regardless of any tuning*. Measured on a 128-core node, single-runtime with all 160 files actively transferring and 2048 in-flight requests:
 
-Both flags partition files deterministically (sorted by name, every Nth entry) so
-shards never overlap. `--workers` and `--shard` work on both upload and download.
+| `--concurrency` / `--parallel-files` | Gbps |
+|---|---|
+| 128 / 16 | 26.1 |
+| 512 / 64 | 26.2 |
+| 1024 / 128 | 27.1 |
+| 2048 / 160 (every file in flight) | 26.5 |
 
-### Optional: jemalloc / mimalloc
+The bottleneck is serialized work inside hyper's connection pool and tokio's scheduler that no amount of submission parallelism can speed up. `--workers N` gives each shard its own runtime + own pool, which is the only way past it.
 
-The default glibc allocator is fine. For heavy multi-worker workloads you can
-swap in jemalloc or mimalloc at build time:
+#### Multi-node sharding
+
+For sharding across multiple *nodes* (not runtimes within one node), use `--shard INDEX/COUNT`:
 
 ```bash
-cargo build --release --features jemalloc
-# or
-cargo build --release --features mimalloc-allocator
+# One process per node, deterministic file partitioning
+azcp copy ... --shard $NODE_IDX/$NODE_COUNT --workers 4 ...
 ```
 
-Measured on a 128-core GB300 node with `--workers 4` (8 runs each, median Gbps):
-glibc 52.0, mimalloc 52.5, jemalloc 52.9, jemalloc+`MALLOC_CONF=background_thread:true,metadata_thp:auto,narenas:64` peaked at 61 with high variance. The gain is within run-to-run noise for download; upload is untested. Not worth making default — enable if you're tuning for your specific workload.
+`--workers` and `--shard` compose: each node runs N workers over its own slice.
+
+### Allocator
+
+Releases ship with **jemalloc** as the default global allocator (Linux/macOS — Windows MSVC silently uses the system allocator). Measured +5-7% throughput vs glibc malloc on sustained multi-worker downloads.
+
+To opt out (system malloc only):
+```bash
+cargo build --release --no-default-features
+```
+
+Mimalloc is also available (no measurable improvement over glibc for this workload, but kept as an option):
+```bash
+cargo build --release --no-default-features --features mimalloc-allocator
+```
 
 ### Throttling and retries
 

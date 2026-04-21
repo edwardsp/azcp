@@ -383,7 +383,7 @@ impl TransferEngine {
             self.config.progress,
         ));
         progress.attach_retry_stats(self.client.retry_stats());
-        let mut file_tasks: JoinSet<Result<()>> = JoinSet::new();
+        let mut file_tasks: JoinSet<(String, Result<()>)> = JoinSet::new();
         let block_size = self.config.block_size;
         let check_md5 = self.config.check_md5;
 
@@ -427,16 +427,18 @@ impl TransferEngine {
                         .await;
                     pb_c.inc(file_size);
                     progress_c.add_bytes(file_size);
-                    match result {
+                    let r = match result {
                         Ok(_) => {
-                            pb_c.finish_and_clear(); progress_c.complete_file();
+                            pb_c.finish_and_clear();
+                            progress_c.complete_file();
                             Ok(())
                         }
                         Err(e) => {
                             pb_c.finish_and_clear();
                             Err(e)
                         }
-                    }
+                    };
+                    (bp, r)
                 });
                 continue;
             }
@@ -517,6 +519,7 @@ impl TransferEngine {
             let overwrite = self.config.overwrite;
 
             file_tasks.spawn(async move {
+                let bp_for_err = bp.clone();
                 let mut block_err: Option<AzcpError> = None;
                 for h in block_handles {
                     match h.await {
@@ -531,18 +534,18 @@ impl TransferEngine {
                 }
                 if let Some(e) = block_err {
                     pb_c.finish_and_clear();
-                    return Err(e);
+                    return (bp_for_err, Err(e));
                 }
                 let whole_md5 = if let Some(t) = md5_task {
                     match t.await {
                         Ok(Ok(arr)) => Some(arr),
                         Ok(Err(e)) => {
                             pb_c.finish_and_clear();
-                            return Err(e);
+                            return (bp_for_err, Err(e));
                         }
                         Err(e) => {
                             pb_c.finish_and_clear();
-                            return Err(AzcpError::Transfer(e.to_string()));
+                            return (bp_for_err, Err(AzcpError::Transfer(e.to_string())));
                         }
                     }
                 } else {
@@ -557,16 +560,18 @@ impl TransferEngine {
                     .put_block_list(&acct, &ctr, &bp, &block_entries, Some(&ct), &opts)
                     .await;
                 drop(_permit);
-                match result {
+                let r = match result {
                     Ok(_) => {
-                        pb_c.finish_and_clear(); progress_c.complete_file();
+                        pb_c.finish_and_clear();
+                        progress_c.complete_file();
                         Ok(())
                     }
                     Err(e) => {
                         pb_c.finish_and_clear();
                         Err(e)
                     }
-                }
+                };
+                (bp_for_err, r)
             });
         }
 
@@ -576,20 +581,20 @@ impl TransferEngine {
 
         while let Some(joined) = file_tasks.join_next().await {
             match joined {
-                Ok(Ok(())) => {
+                Ok((_, Ok(()))) => {
                     succeeded += 1;
                 }
-                Ok(Err(AzcpError::AlreadyExists(name))) => {
+                Ok((name, Err(AzcpError::AlreadyExists(_)))) => {
                     skipped += 1;
                     progress.println(&format!("skipped (exists): {name}"));
                 }
-                Ok(Err(e)) => {
+                Ok((name, Err(e))) => {
                     failed += 1;
-                    progress.println(&format!("ERROR: {e}"));
+                    eprintln!("ERROR: {name}: {e}");
                 }
                 Err(e) => {
                     failed += 1;
-                    progress.println(&format!("ERROR: {e}"));
+                    eprintln!("ERROR: <task join>: {e}");
                 }
             }
         }
@@ -661,7 +666,7 @@ impl TransferEngine {
             self.config.progress,
         ));
         progress.attach_retry_stats(self.client.retry_stats());
-        let mut file_tasks: JoinSet<Result<()>> = JoinSet::new();
+        let mut file_tasks: JoinSet<(String, Result<()>)> = JoinSet::new();
         let block_size = self.config.block_size;
         let check_md5 = self.config.check_md5;
 
@@ -705,109 +710,114 @@ impl TransferEngine {
 
             file_tasks.spawn(async move {
                 let _file_permit = file_permit;
+                let name_for_err = blob_name.clone();
 
-                if file_size == 0 || file_size < block_size {
-                    let result = async {
-                        let permit = chunk_sem.acquire_owned().await.unwrap();
-                        let data = client.get_blob(&acct, &ctr, &blob_name).await?;
-                        drop(permit);
-                        if check_md5 {
-                            verify_md5(&blob_name, exp.as_deref(), &data)?;
+                let r: Result<()> = async move {
+                    if file_size == 0 || file_size < block_size {
+                        let result = async {
+                            let permit = chunk_sem.acquire_owned().await.unwrap();
+                            let data = client.get_blob(&acct, &ctr, &blob_name).await?;
+                            drop(permit);
+                            if check_md5 {
+                                verify_md5(&blob_name, exp.as_deref(), &data)?;
+                            }
+                            let len = data.len() as u64;
+                            tokio::fs::write(&local, &data).await?;
+                            pb_c.inc(len);
+                            progress_c.add_bytes(len);
+                            Ok::<u64, AzcpError>(len)
                         }
-                        let len = data.len() as u64;
-                        tokio::fs::write(&local, &data).await?;
-                        pb_c.inc(len);
-                        progress_c.add_bytes(len);
-                        Ok::<u64, AzcpError>(len)
+                        .await;
+                        return match result {
+                            Ok(_) => {
+                                pb_c.finish_and_clear();
+                                progress_c.complete_file();
+                                Ok(())
+                            }
+                            Err(e) => {
+                                pb_c.finish_and_clear();
+                                Err(e)
+                            }
+                        };
                     }
-                    .await;
-                    return match result {
-                        Ok(_) => {
-                            pb_c.finish_and_clear();
-                            progress_c.complete_file();
+
+                    let f = tokio::fs::File::create(&local).await?;
+                    f.set_len(file_size).await?;
+                    drop(f);
+
+                    // Open file ONCE per blob and share via Arc<std::fs::File>.
+                    // pwrite (write_all_at) is thread-safe at the OS level: many
+                    // chunk tasks can write to disjoint offsets concurrently
+                    // without a Mutex. Eliminates per-block open/seek/flush
+                    // syscalls that were the dominant CPU cost.
+                    let shared_file = Arc::new(
+                        std::fs::OpenOptions::new()
+                            .write(true)
+                            .open(&local)
+                            .map_err(|e| AzcpError::Transfer(e.to_string()))?,
+                    );
+
+                    let num_chunks = (file_size + block_size - 1) / block_size;
+                    let mut block_handles: Vec<tokio::task::JoinHandle<Result<()>>> =
+                        Vec::with_capacity(num_chunks as usize);
+
+                    for i in 0..num_chunks {
+                        let offset = i * block_size;
+                        let length = std::cmp::min(block_size, file_size - offset);
+
+                        let permit = chunk_sem.clone().acquire_owned().await.unwrap();
+                        let client_c = client.clone();
+                        let acct_c = acct.clone();
+                        let ctr_c = ctr.clone();
+                        let blob_name_c = blob_name.clone();
+                        let file_c = shared_file.clone();
+                        let pb_c2 = pb_c.clone();
+                        let prog_c2 = progress_c.clone();
+
+                        block_handles.push(tokio::spawn(async move {
+                            let _permit = permit;
+                            let data = client_c
+                                .get_blob_range(&acct_c, &ctr_c, &blob_name_c, offset, length)
+                                .await?;
+                            let n = data.len() as u64;
+                            tokio::task::spawn_blocking(move || pwrite_all(&file_c, &data, offset))
+                                .await
+                                .map_err(|e| AzcpError::Transfer(e.to_string()))?
+                                .map_err(|e| AzcpError::Transfer(e.to_string()))?;
+                            pb_c2.inc(n);
+                            prog_c2.add_bytes(n);
                             Ok(())
-                        }
-                        Err(e) => {
-                            pb_c.finish_and_clear();
-                            Err(e)
-                        }
-                    };
-                }
-
-                let f = tokio::fs::File::create(&local).await?;
-                f.set_len(file_size).await?;
-                drop(f);
-
-                // Open file ONCE per blob and share via Arc<std::fs::File>.
-                // pwrite (write_all_at) is thread-safe at the OS level: many
-                // chunk tasks can write to disjoint offsets concurrently
-                // without a Mutex. Eliminates per-block open/seek/flush
-                // syscalls that were the dominant CPU cost.
-                let shared_file = Arc::new(
-                    std::fs::OpenOptions::new()
-                        .write(true)
-                        .open(&local)
-                        .map_err(|e| AzcpError::Transfer(e.to_string()))?,
-                );
-
-                let num_chunks = (file_size + block_size - 1) / block_size;
-                let mut block_handles: Vec<tokio::task::JoinHandle<Result<()>>> =
-                    Vec::with_capacity(num_chunks as usize);
-
-                for i in 0..num_chunks {
-                    let offset = i * block_size;
-                    let length = std::cmp::min(block_size, file_size - offset);
-
-                    let permit = chunk_sem.clone().acquire_owned().await.unwrap();
-                    let client_c = client.clone();
-                    let acct_c = acct.clone();
-                    let ctr_c = ctr.clone();
-                    let blob_name_c = blob_name.clone();
-                    let file_c = shared_file.clone();
-                    let pb_c2 = pb_c.clone();
-                    let prog_c2 = progress_c.clone();
-
-                    block_handles.push(tokio::spawn(async move {
-                        let _permit = permit;
-                        let data = client_c
-                            .get_blob_range(&acct_c, &ctr_c, &blob_name_c, offset, length)
-                            .await?;
-                        let n = data.len() as u64;
-                        tokio::task::spawn_blocking(move || pwrite_all(&file_c, &data, offset))
-                            .await
-                            .map_err(|e| AzcpError::Transfer(e.to_string()))?
-                            .map_err(|e| AzcpError::Transfer(e.to_string()))?;
-                        pb_c2.inc(n);
-                        prog_c2.add_bytes(n);
-                        Ok(())
-                    }));
-                }
-
-                let mut block_err: Option<AzcpError> = None;
-                for h in block_handles {
-                    match h.await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) if block_err.is_none() => block_err = Some(e),
-                        Ok(Err(_)) => {}
-                        Err(e) if block_err.is_none() => {
-                            block_err = Some(AzcpError::Transfer(e.to_string()))
-                        }
-                        Err(_) => {}
+                        }));
                     }
-                }
-                if let Some(e) = block_err {
-                    pb_c.finish_and_clear();
-                    return Err(e);
-                }
-                if check_md5 {
-                    if let Err(e) = verify_md5_file(&blob_name, exp.as_deref(), &local).await {
+
+                    let mut block_err: Option<AzcpError> = None;
+                    for h in block_handles {
+                        match h.await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) if block_err.is_none() => block_err = Some(e),
+                            Ok(Err(_)) => {}
+                            Err(e) if block_err.is_none() => {
+                                block_err = Some(AzcpError::Transfer(e.to_string()))
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                    if let Some(e) = block_err {
                         pb_c.finish_and_clear();
                         return Err(e);
                     }
+                    if check_md5 {
+                        if let Err(e) = verify_md5_file(&blob_name, exp.as_deref(), &local).await {
+                            pb_c.finish_and_clear();
+                            return Err(e);
+                        }
+                    }
+                    pb_c.finish_and_clear();
+                    progress_c.complete_file();
+                    Ok(())
                 }
-                pb_c.finish_and_clear();
-                progress_c.complete_file();
-                Ok(())
+                .await;
+                (name_for_err, r)
             });
         }
 
@@ -816,16 +826,16 @@ impl TransferEngine {
 
         while let Some(joined) = file_tasks.join_next().await {
             match joined {
-                Ok(Ok(())) => {
+                Ok((_, Ok(()))) => {
                     succeeded += 1;
                 }
-                Ok(Err(e)) => {
+                Ok((name, Err(e))) => {
                     failed += 1;
-                    progress.println(&format!("ERROR: {e}"));
+                    eprintln!("ERROR: {name}: {e}");
                 }
                 Err(e) => {
                     failed += 1;
-                    progress.println(&format!("ERROR: {e}"));
+                    eprintln!("ERROR: <task join>: {e}");
                 }
             }
         }
