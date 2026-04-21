@@ -76,11 +76,15 @@ pub fn get_storage_token_workload() -> Result<Option<String>, AzcpError> {
 
 pub fn get_storage_token_imds() -> Result<Option<String>, AzcpError> {
     let client_id = std::env::var(WORKLOAD_CLIENT_ID).ok();
+    let resource_id = std::env::var("AZURE_MSI_RESOURCE_ID").ok();
     let mut url =
         format!("{IMDS_ENDPOINT}?api-version={IMDS_API_VERSION}&resource={STORAGE_RESOURCE}");
     if let Some(ref cid) = client_id {
         url.push_str("&client_id=");
         url.push_str(cid);
+    } else if let Some(ref rid) = resource_id {
+        url.push_str("&msi_res_id=");
+        url.push_str(rid);
     }
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(3))
@@ -97,6 +101,29 @@ pub fn get_storage_token_imds() -> Result<Option<String>, AzcpError> {
         .text()
         .map_err(|e| AzcpError::Auth(format!("read IMDS body: {e}")))?;
     if !status.is_success() {
+        // Azure IMDS error bodies are JSON like {"error":"...","error_description":"..."}.
+        // Classify so callers can distinguish "this VM has no identity / not Azure"
+        // (skip → Ok(None)) from "transient or actionable failure" (Err).
+        if body.contains("Multiple user assigned identities") {
+            return Err(AzcpError::Auth(format!(
+                "IMDS: multiple user-assigned identities are attached to this VM. \
+                 Set AZURE_CLIENT_ID (preferred) or AZURE_MSI_RESOURCE_ID to select one. \
+                 List them with: `az vmss identity show -g <node-rg> -n <vmss-name>` or \
+                 `az vm identity show -g <rg> -n <vm>`."
+            )));
+        }
+        // 400 with "Identity not found" / "No managed identity" = Azure VM without
+        // an MSI assigned (or wrong client_id). 404 = endpoint shape mismatch
+        // (e.g. EC2's link-local responder). Both mean "this auth path doesn't
+        // apply"; fall through to the next credential source.
+        let not_applicable = status.as_u16() == 404
+            || (status.as_u16() == 400
+                && (body.contains("Identity not found")
+                    || body.contains("No managed identity")
+                    || body.contains("identity_not_found")));
+        if not_applicable {
+            return Ok(None);
+        }
         return Err(AzcpError::Auth(format!("IMDS HTTP {status}: {body}")));
     }
     let parsed: TokenResponse = serde_json::from_str(&body)

@@ -190,15 +190,7 @@ async fn download(
 }
 
 fn resolve_credential(loc: &BlobLocation) -> Result<Credential> {
-    if let Some(ref sas) = loc.sas_token {
-        return Ok(Credential::Sas {
-            token: sas.clone(),
-        });
-    }
-    if let Some(cred) = Credential::from_env_or_cli(&loc.account)? {
-        return Ok(cred);
-    }
-    Ok(Credential::Anonymous)
+    Credential::resolve_or_anonymous(&loc.account, loc.sas_token.as_deref())
 }
 
 fn print_summary(op: &str, s: &TransferSummary) {
