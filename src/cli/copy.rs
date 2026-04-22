@@ -43,6 +43,7 @@ pub async fn run_with_shared(
         progress: args.progress,
         max_retries: args.max_retries,
         shard: args.shard,
+        shardlist: args.shardlist.clone(),
     };
 
     match (&source, &dest) {
@@ -50,6 +51,11 @@ pub async fn run_with_shared(
             if config.discard {
                 return Err(AzcpError::Transfer(
                     "--discard is only valid for downloads (blob -> local)".into(),
+                ));
+            }
+            if config.shardlist.is_some() {
+                return Err(AzcpError::Transfer(
+                    "--shardlist is only valid for downloads (blob -> local)".into(),
                 ));
             }
             upload(src, dst, config, shared).await

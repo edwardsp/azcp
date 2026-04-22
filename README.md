@@ -162,6 +162,55 @@ node).
 - **Single-blob copies ignore sharding.** Sharding partitions a *file list*. A single explicit blob URL is a one-element list; `--shard` on it is a no-op for all but `INDEX=0`.
 - **`--shard 0/1` is a deliberate no-op** (defensive, so wrapper scripts don't break when `N=1`).
 
+##### Caching the source listing with `--shardlist`
+
+For very large source sets (millions of blobs) or for repeated transfers of
+the same dataset (e.g. pulling the same model checkpoint to many nodes),
+the LIST API call can dominate startup — and with `--shard i/N` it pays
+that cost `N` times. `--shardlist FILE` lets you generate the listing once
+and reuse it across runs and shards, skipping LIST entirely.
+
+Generate the manifest once (any machine with credentials):
+
+```bash
+azcp ls https://acct.blob.core.windows.net/ctr/models/llama/ \
+  --recursive --machine-readable > llama.shardlist
+```
+
+The output is plain TSV (`<name>\t<size>\t<last-modified>` per line); you
+can ship it alongside the model, check it into git, regenerate it on a
+schedule, or hand-edit it to subset the transfer.
+
+Then consume on every node / process:
+
+```bash
+for i in 0 1 2 3; do
+  azcp copy https://acct.blob.core.windows.net/ctr/models/llama/ /mnt/nvme/llama/ \
+    --recursive --shardlist llama.shardlist --shard $i/4 \
+    --concurrency 32 --block-size 16777216 &
+done
+wait
+```
+
+Notes:
+
+- **Trust the file.** `azcp` does not re-validate the manifest against the live
+  container. If a blob has been deleted, that file's GET fails with `404`
+  and counts as a per-file failure (the rest of the transfer continues). If
+  a blob has been resized, the GET still streams what's there — only the
+  pre-computed total bytes for the progress bar will be off.
+- **`--include-pattern` / `--exclude-pattern` still apply** on top of the
+  shardlist, after parsing it. Use them to subset without regenerating.
+- **`--shard` still applies** on top of the shardlist — that's the whole
+  point. Each process reads the same file, runs the same LPT split, and
+  takes its slice.
+- **Download-only.** `--shardlist` on uploads or local→local copies is
+  rejected with a clear error; for uploads, walking the local filesystem
+  is already cheap.
+- **Comment lines** starting with `#` and blank lines are skipped, so you
+  can annotate the file freely. `<DIR>` rollup rows from non-recursive
+  `azcp ls` output are also skipped automatically.
+
 ### Allocator
 
 Releases ship with **jemalloc** as the default global allocator (Linux/macOS — Windows MSVC silently uses the system allocator). Measured +5-7% throughput vs glibc malloc on sustained multi-worker downloads.

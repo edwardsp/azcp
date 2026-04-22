@@ -55,6 +55,7 @@ fn build_engine(args: &SyncArgs, credential: Credential) -> Result<Arc<TransferE
         progress: args.progress,
         max_retries: args.max_retries,
         shard: args.shard,
+        shardlist: None,
     };
     Ok(Arc::new(TransferEngine::new(client, config)?))
 }

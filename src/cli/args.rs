@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::{Args, Parser, Subcommand};
 
 pub fn parse_shard(s: &str) -> Result<(usize, usize), String> {
@@ -120,6 +122,13 @@ pub struct CopyArgs {
         help = "Spawn N independent tokio runtimes (each with its own connection pool + shard). Single-process alternative to external --shard."
     )]
     pub workers: usize,
+
+    #[arg(
+        long,
+        value_name = "FILE",
+        help = "Read source blob listing from FILE (TSV: <name>\\t<size>[\\t<modified>]) instead of calling LIST. Generate with: azcp ls <url> --recursive --machine-readable > FILE. Download-only."
+    )]
+    pub shardlist: Option<PathBuf>,
 }
 
 #[derive(Args)]

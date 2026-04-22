@@ -642,10 +642,13 @@ impl TransferEngine {
         blob_prefix: &str,
         local_dir: &Path,
     ) -> Result<TransferSummary> {
-        let mut blobs = self
-            .client
-            .list_blobs(account, container, Some(blob_prefix), self.config.recursive)
-            .await?;
+        let mut blobs = if let Some(path) = &self.config.shardlist {
+            read_shardlist(path)?
+        } else {
+            self.client
+                .list_blobs(account, container, Some(blob_prefix), self.config.recursive)
+                .await?
+        };
         blobs.retain(|b| {
             let relative = b
                 .name
@@ -903,6 +906,64 @@ impl TransferEngine {
     }
 }
 
+// Parse a shardlist file produced by `azcp ls --recursive --machine-readable`.
+// Format is TSV with at minimum two fields per line: <name>\t<size>[\t<...>].
+// Lines that are blank, start with `#`, or have a non-numeric size field
+// (e.g. the `<name>\t-\tDIR` rows emitted for prefixes) are skipped so the
+// same file works for both human inspection and machine consumption.
+fn read_shardlist(path: &Path) -> Result<Vec<crate::storage::blob::models::BlobItem>> {
+    use crate::storage::blob::models::{BlobItem, BlobProperties};
+    let content = std::fs::read_to_string(path).map_err(|e| {
+        AzcpError::Transfer(format!("read shardlist {}: {e}", path.display()))
+    })?;
+    let mut out = Vec::new();
+    for (lineno, raw) in content.lines().enumerate() {
+        let line = raw.trim_end_matches('\r');
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut fields = line.split('\t');
+        let name = match fields.next() {
+            Some(n) if !n.is_empty() => n.to_string(),
+            _ => {
+                return Err(AzcpError::Transfer(format!(
+                    "shardlist {}:{}: missing name field",
+                    path.display(),
+                    lineno + 1
+                )))
+            }
+        };
+        let size_field = fields.next().ok_or_else(|| {
+            AzcpError::Transfer(format!(
+                "shardlist {}:{}: missing size field",
+                path.display(),
+                lineno + 1
+            ))
+        })?;
+        let Ok(size) = size_field.parse::<u64>() else {
+            // Non-numeric size (e.g. "-" for DIR rollups): skip silently.
+            continue;
+        };
+        let last_modified = fields.next().and_then(|s| {
+            let s = s.trim();
+            if s.is_empty() || s == "-" { None } else { Some(s.to_string()) }
+        });
+        out.push(BlobItem {
+            name,
+            properties: Some(BlobProperties {
+                last_modified,
+                content_length: Some(size),
+                content_type: None,
+                content_md5: None,
+                etag: None,
+                blob_type: None,
+                access_tier: None,
+            }),
+        });
+    }
+    Ok(out)
+}
+
 // Size-aware partitioning via Longest-Processing-Time (LPT) bin packing.
 // Each worker independently re-runs the listing and applies this on the full
 // set; determinism (same partition on every worker) requires identical input
@@ -1066,7 +1127,8 @@ fn pwrite_all(file: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<
 
 #[cfg(test)]
 mod tests {
-    use super::apply_shard;
+    use super::{apply_shard, read_shardlist};
+    use std::io::Write;
 
     #[test]
     fn shard_partitions_disjointly() {
@@ -1114,5 +1176,59 @@ mod tests {
         assert_eq!(totals.iter().sum::<u64>(), 104);
         assert_eq!(*totals.iter().max().unwrap(), 100);
         assert_eq!(*totals.iter().min().unwrap(), 4);
+    }
+
+    fn write_tmp(name: &str, body: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "azcp-shardlist-{}-{}.tsv",
+            name,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut f = std::fs::File::create(&p).unwrap();
+        f.write_all(body.as_bytes()).unwrap();
+        p
+    }
+
+    #[test]
+    fn shardlist_parses_basic() {
+        let p = write_tmp(
+            "basic",
+            "a/x.bin\t100\tWed, 22 Apr 2026 07:33:41 GMT\nb/y.bin\t200\t-\n",
+        );
+        let out = read_shardlist(&p).unwrap();
+        std::fs::remove_file(&p).ok();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].name, "a/x.bin");
+        assert_eq!(out[0].properties.as_ref().unwrap().content_length, Some(100));
+        assert_eq!(
+            out[0].properties.as_ref().unwrap().last_modified.as_deref(),
+            Some("Wed, 22 Apr 2026 07:33:41 GMT")
+        );
+        assert_eq!(out[1].properties.as_ref().unwrap().content_length, Some(200));
+        assert!(out[1].properties.as_ref().unwrap().last_modified.is_none());
+    }
+
+    #[test]
+    fn shardlist_skips_blank_comment_and_dir_rows() {
+        let p = write_tmp(
+            "skip",
+            "# header line\n\nfoo/bar\t42\t-\nsubdir/\t-\tDIR\nbaz\t7\n",
+        );
+        let out = read_shardlist(&p).unwrap();
+        std::fs::remove_file(&p).ok();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].name, "foo/bar");
+        assert_eq!(out[1].name, "baz");
+    }
+
+    #[test]
+    fn shardlist_errors_on_missing_size() {
+        let p = write_tmp("nosize", "lonely-name\n");
+        let err = read_shardlist(&p).unwrap_err();
+        std::fs::remove_file(&p).ok();
+        assert!(err.to_string().contains("missing size field"), "{err}");
     }
 }

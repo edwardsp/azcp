@@ -21,6 +21,7 @@ pub struct TransferConfig {
     pub progress: bool,
     pub max_retries: u32,
     pub shard: Option<(usize, usize)>,
+    pub shardlist: Option<PathBuf>,
 }
 
 impl Default for TransferConfig {
@@ -39,6 +40,7 @@ impl Default for TransferConfig {
             progress: false,
             max_retries: DEFAULT_MAX_RETRIES,
             shard: None,
+            shardlist: None,
         }
     }
 }
