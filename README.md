@@ -232,13 +232,15 @@ On 10/25 GbE the techniques here still apply, but the gains are small — `--wor
 
 The following was measured downloading a 385 GiB / 175-file checkpoint from a single Azure storage account to a single node with a 200 Gbps NIC. Each row removes one bottleneck:
 
-| Configuration | App Gbps | Wire Gbps | NIC util |
-|---|---:|---:|---:|
-| Kubernetes overlay pod (default) | 62.7 | ~70 | 35% |
-| Pod with `hostNetwork: true` | 117 | 127 | 64% |
-| `hostNetwork` + NUMA-pinned (single proc) | 131 | 145 | 73% |
-| `hostNetwork` + NUMA-pinned, 2 procs | 150 | 158 | 79% |
-| `hostNetwork` + NUMA-pinned, **4 procs** | **170** | **186** | **93%** |
+| Configuration | `azcp` flags (per process) | Procs | App Gbps | Wire Gbps | NIC util |
+|---|---|---:|---:|---:|---:|
+| Kubernetes overlay pod (default) | `--workers 8 --concurrency 32 --block-size 16777216` | 1 | 62.7 | ~70 | 35% |
+| Pod with `hostNetwork: true` | `--workers 8 --concurrency 64 --block-size 16777216` | 1 | 117 | 127 | 64% |
+| `hostNetwork` + NUMA-pinned (single proc) | `numactl --cpunodebind=N --membind=N azcp ... --workers 8 --concurrency 64 --block-size 16777216` | 1 | 131 | 145 | 73% |
+| `hostNetwork` + NUMA-pinned, 2 procs | `numactl ... azcp ... --workers 1 --concurrency 32 --shard i/2 --block-size 16777216` | 2 | 150 | 158 | 79% |
+| `hostNetwork` + NUMA-pinned, **4 procs** | `numactl ... azcp ... --workers 1 --concurrency 32 --shard i/4 --block-size 16777216` | **4** | **170** | **186** | **93%** |
+
+All rows used the same 385 GiB / 175-file dataset (~2.2 GiB avg file size) with `--recursive`. `--parallel-files` was left at its default (`min(concurrency, file_count)`). The single-proc rows benefit from higher per-runtime concurrency (`--concurrency 64`); the multi-proc rows split work via `--shard` and use lower per-process concurrency since aggregate in-flight requests = `procs × concurrency`.
 
 Net: **+103 Gbps (2.7×)** by combining `hostNetwork` (or running on bare metal/VMs), NUMA pinning, and multiple cooperating processes.
 
