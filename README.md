@@ -112,16 +112,55 @@ A single tokio runtime + single `reqwest::Client` has a hard ceiling around **25
 
 The bottleneck is serialized work inside hyper's connection pool and tokio's scheduler that no amount of submission parallelism can speed up. `--workers N` gives each shard its own runtime + own pool, which is the only way past it.
 
-#### Multi-node sharding
+#### Multi-process / multi-node sharding
 
-For sharding across multiple *nodes* (not runtimes within one node), use `--shard INDEX/COUNT`:
+`--shard INDEX/COUNT` partitions the workload deterministically across `COUNT`
+independent invocations. Each invocation lists the full source, runs the same
+**size-balanced LPT bin packing** (Longest-Processing-Time), and keeps only
+the files assigned to its `INDEX`. No coordination between processes is
+needed — the partition is identical on every shard because the input list,
+sort order (`size DESC, name ASC`), and tie-breakers are deterministic.
 
 ```bash
-# One process per node, deterministic file partitioning
-azcp copy ... --shard $NODE_IDX/$NODE_COUNT --workers 4 ...
+# 4 cooperating processes (one per node, or all on one host)
+for i in 0 1 2 3; do
+  azcp copy https://acct.blob.core.windows.net/ctr/prefix/ ./dst/ \
+    --recursive --shard $i/4 --concurrency 32 --block-size 16777216 &
+done
+wait
 ```
 
-`--workers` and `--shard` compose: each node runs N workers over its own slice.
+**`INDEX` is 0-based.** Valid values for `--shard i/N` are `i ∈ [0, N-1]`.
+`--shard 4/4` is rejected with `shard index 4 must be < count 4`.
+
+##### `--shard` vs `--workers` (pick one)
+
+| | `--workers N` | `--shard i/N` |
+|---|---|---|
+| Process model | One process, N tokio runtimes | N independent processes |
+| Listing cost | 1 LIST (shared) | N LIST calls (one per process) |
+| Progress / stats | Unified across workers | Per-process (you aggregate manually) |
+| Fault isolation | One OOM kills all workers | Independent — one process can crash |
+| Cross-host scaling | No (single process) | Yes (one process per node) |
+| NUMA pinning | One process can only pin to one NUMA | Each process pins independently |
+
+The two flags **do not compose**: passing `--shard` alongside `--workers > 1`
+prints a warning and the outer `--shard` is ignored (workers do their own
+internal LPT split, so the user-supplied shard would conflict). For
+multi-node deployments, run one process per node with `--shard $NODE/$NODES`
+and leave `--workers` at 1, or scale `--workers` within each node and
+partition across nodes by some other means (e.g. different prefixes per
+node).
+
+##### Sharding gotchas
+
+- **Source must be stable during the run.** If a blob appears or disappears between two processes' listings, their owner maps diverge → some files get downloaded twice or skipped. Don't shard against a source that's being mutated.
+- **Identical CLI args required.** All N invocations must use the same source URL, `--include-pattern`, `--exclude-pattern`, etc. Different filters → different input sets → different LPT result → overlap or gaps. Only `--shard i/N` should differ.
+- **No cross-process retry.** If process 3 of 4 crashes, you have 3/4 of the data and the failed shard isn't picked up by anyone else. Wrap each invocation in your own retry loop, or re-run that specific `--shard 3/4` manually.
+- **`N × LIST` cost.** Each process re-lists the source. Cheap for ≤10K blobs; for millions of blobs, listing dominates startup. Prefer `--workers N` (single listing) for very large file counts on a single host.
+- **LPT needs `file_count >> shard_count`.** With 5 files across 4 shards, one shard may get nothing or a giant outlier dominates. As a rule of thumb, don't shard finer than ~4× the number of large files.
+- **Single-blob copies ignore sharding.** Sharding partitions a *file list*. A single explicit blob URL is a one-element list; `--shard` on it is a no-op for all but `INDEX=0`.
+- **`--shard 0/1` is a deliberate no-op** (defensive, so wrapper scripts don't break when `N=1`).
 
 ### Allocator
 
