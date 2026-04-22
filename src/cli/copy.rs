@@ -9,7 +9,7 @@ use crate::error::{AzcpError, Result};
 use crate::storage::blob::client::{BlobClient, LatencyStats, RetryStats};
 use crate::storage::location::{self, BlobLocation, Location};
 
-use super::args::CopyArgs;
+use super::args::{resolve_progress, CopyArgs};
 
 #[derive(Clone, Default)]
 pub struct SharedTransfer {
@@ -40,7 +40,7 @@ pub async fn run_with_shared(
         include_pattern: args.include_pattern.clone(),
         exclude_pattern: args.exclude_pattern.clone(),
         check_md5: args.check_md5,
-        progress: args.progress,
+        progress: resolve_progress(args.progress, args.no_progress),
         max_retries: args.max_retries,
         shard: args.shard,
         shardlist: args.shardlist.clone(),

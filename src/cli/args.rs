@@ -2,6 +2,23 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
+// Resolve the three-state progress preference: explicit --no-progress wins,
+// then explicit --progress, otherwise auto-detect based on whether stderr is
+// attached to a terminal. Auto-detection avoids polluting redirected logs and
+// CI captures with cursor-rewriting escapes; the explicit flags are escape
+// hatches for when detection guesses wrong (e.g. allocated PTY in CI, or
+// nohup'd run being tail -f'd).
+pub fn resolve_progress(progress: bool, no_progress: bool) -> bool {
+    use std::io::IsTerminal;
+    if no_progress {
+        return false;
+    }
+    if progress {
+        return true;
+    }
+    std::io::stderr().is_terminal()
+}
+
 pub fn parse_shard(s: &str) -> Result<(usize, usize), String> {
     let (i, n) = s
         .split_once('/')
@@ -106,8 +123,15 @@ pub struct CopyArgs {
     #[arg(long)]
     pub exclude_pattern: Option<String>,
 
-    #[arg(long, help = "Show per-file progress bars with throughput")]
+    #[arg(
+        long,
+        conflicts_with = "no_progress",
+        help = "Force per-file progress bars on (overrides TTY auto-detect; default: on if stderr is a TTY)"
+    )]
     pub progress: bool,
+
+    #[arg(long, help = "Disable progress display (overrides TTY auto-detect)")]
+    pub no_progress: bool,
 
     #[arg(
         long,
@@ -178,8 +202,15 @@ pub struct SyncArgs {
     #[arg(long)]
     pub exclude_pattern: Option<String>,
 
-    #[arg(long, help = "Show per-file progress bars with throughput")]
+    #[arg(
+        long,
+        conflicts_with = "no_progress",
+        help = "Force per-file progress bars on (overrides TTY auto-detect; default: on if stderr is a TTY)"
+    )]
     pub progress: bool,
+
+    #[arg(long, help = "Disable progress display (overrides TTY auto-detect)")]
+    pub no_progress: bool,
 
     #[arg(
         long,
@@ -239,8 +270,15 @@ pub struct RemoveArgs {
     #[arg(long)]
     pub exclude_pattern: Option<String>,
 
-    #[arg(long, help = "Show progress bar with deletion rate")]
+    #[arg(
+        long,
+        conflicts_with = "no_progress",
+        help = "Force progress display on (overrides TTY auto-detect; default: on if stderr is a TTY)"
+    )]
     pub progress: bool,
+
+    #[arg(long, help = "Disable progress display (overrides TTY auto-detect)")]
+    pub no_progress: bool,
 }
 
 #[derive(Args)]

@@ -10,7 +10,7 @@ use crate::error::Result;
 use crate::storage::blob::client::BlobClient;
 use crate::storage::location::{self, BlobLocation, Location};
 
-use super::args::RemoveArgs;
+use super::args::{resolve_progress, RemoveArgs};
 
 pub async fn run(args: &RemoveArgs) -> Result<()> {
     let location = location::parse_location(&args.url)?;
@@ -92,7 +92,8 @@ async fn remove_azure(loc: &BlobLocation, args: &RemoveArgs) -> Result<()> {
         return Ok(());
     }
 
-    let pb = if args.progress {
+    let show_progress = resolve_progress(args.progress, args.no_progress);
+    let pb = if show_progress {
         let pb = ProgressBar::new(total);
         pb.set_style(
             ProgressStyle::default_bar()
@@ -135,7 +136,7 @@ async fn remove_azure(loc: &BlobLocation, args: &RemoveArgs) -> Result<()> {
             Ok(Ok(_)) => deleted += 1,
             Ok(Err(e)) => {
                 failed += 1;
-                if args.progress {
+                if show_progress {
                     pb.println(format!("ERROR: {e}"));
                 } else {
                     eprintln!("ERROR: {e}");
@@ -143,7 +144,7 @@ async fn remove_azure(loc: &BlobLocation, args: &RemoveArgs) -> Result<()> {
             }
             Err(e) => {
                 failed += 1;
-                if args.progress {
+                if show_progress {
                     pb.println(format!("ERROR: {e}"));
                 } else {
                     eprintln!("ERROR: {e}");

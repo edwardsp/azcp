@@ -72,14 +72,19 @@ azcp copy https://acct.blob.core.windows.net/ctr/path ./local/dir --recursive
 
 # Tune parallelism
 azcp copy ./big https://acct.blob.core.windows.net/ctr/ \
-  --recursive --concurrency 64 --block-size 8388608 --progress
+  --recursive --concurrency 64 --block-size 8388608
 
 # Filter with globs
 azcp copy ./src https://acct.blob.core.windows.net/ctr/backup/ \
   --recursive --include-pattern '*.rs' --exclude-pattern 'target/*'
 ```
 
-Flags: `--recursive`, `--no-overwrite`, `--block-size`, `--concurrency`, `--parallel-files`, `--workers`, `--shard`, `--max-retries`, `--dry-run`, `--check-md5`, `--include-pattern`, `--exclude-pattern`, `--progress`.
+Flags: `--recursive`, `--no-overwrite`, `--block-size`, `--concurrency`, `--parallel-files`, `--workers`, `--shard`, `--shardlist`, `--max-retries`, `--dry-run`, `--check-md5`, `--include-pattern`, `--exclude-pattern`, `--progress`, `--no-progress`.
+
+> Progress display is **on by default when stderr is a TTY** and silenced
+> automatically when output is redirected (logs, CI, `kubectl logs`). Pass
+> `--progress` to force it on (e.g. allocated PTY in CI, or `nohup` runs you
+> intend to `tail -f`) and `--no-progress` to force it off.
 
 ### Throughput tuning
 
@@ -231,7 +236,7 @@ Every operation retries `503 ServerBusy`, `429 Too Many Requests`, and transient
 `5xx` responses with exponential backoff + jitter (honoring `Retry-After`). The
 retry budget is controlled by `--max-retries` (default 5, env `AZCP_MAX_RETRIES`).
 
-When `--progress` is on, the total bar suffix shows live retry counters, e.g.
+When progress display is active, the total bar suffix shows live retry counters, e.g.
 `[retry 503x12 429x2]`, so you can tell at a glance that Azure is pushing
 back. If uploads ultimately fail after exhausting retries, `azcp` exits with
 a non-zero status and prints a `Failed: N` summary.
@@ -295,7 +300,7 @@ azcp rm https://acct.blob.core.windows.net/ctr/file.bin
 
 # Recursive with progress and filters
 azcp rm https://acct.blob.core.windows.net/ctr/prefix \
-  --recursive --progress --include-pattern '*.log'
+  --recursive --include-pattern '*.log'
 ```
 
 ### mk

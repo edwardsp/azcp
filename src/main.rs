@@ -87,7 +87,11 @@ fn run_workers(args: &CopyArgs) -> Result<()> {
     }
     eprintln!("[workers] spawning {n} independent runtimes");
 
-    let shared_progress = Arc::new(TransferProgress::new(0, 0, args.progress));
+    let shared_progress = Arc::new(TransferProgress::new(
+        0,
+        0,
+        azcp::cli::args::resolve_progress(args.progress, args.no_progress),
+    ));
     let shared_retry = Arc::new(RetryStats::default());
     let shared_latency = Arc::new(LatencyStats::default());
 

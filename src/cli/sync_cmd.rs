@@ -19,7 +19,7 @@ use crate::storage::blob::models::BlobItem;
 use crate::storage::local::{self, LocalEntry};
 use crate::storage::location::{self, BlobLocation, Location};
 
-use super::args::{CompareMethod, SyncArgs};
+use super::args::{resolve_progress, CompareMethod, SyncArgs};
 
 pub async fn run(args: &SyncArgs) -> Result<()> {
     let source = location::parse_location(&args.source)?;
@@ -52,7 +52,7 @@ fn build_engine(args: &SyncArgs, credential: Credential) -> Result<Arc<TransferE
         check_md5: false,
         include_pattern: args.include_pattern.clone(),
         exclude_pattern: args.exclude_pattern.clone(),
-        progress: args.progress,
+        progress: resolve_progress(args.progress, args.no_progress),
         max_retries: args.max_retries,
         shard: args.shard,
         shardlist: None,
