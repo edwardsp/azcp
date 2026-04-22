@@ -74,10 +74,11 @@ async fn upload(
     let src_path = Path::new(source);
 
     if src_path.is_dir() {
+        let started = std::time::Instant::now();
         let summary = engine
             .upload_directory(src_path, &dest.account, &dest.container, &dest.path)
             .await?;
-        print_summary("Upload", &summary);
+        print_summary("Upload", &summary, started.elapsed());
         print_retry_stats(engine.client());
         check_summary(&summary)?;
     } else if src_path.is_file() {
@@ -139,6 +140,7 @@ async fn download(
     let dest_path = Path::new(dest);
 
     if source.path.is_empty() || source.path.ends_with('/') {
+        let started = std::time::Instant::now();
         let summary = engine
             .download_directory(
                 &source.account,
@@ -147,7 +149,7 @@ async fn download(
                 dest_path,
             )
             .await?;
-        print_summary("Download", &summary);
+        print_summary("Download", &summary, started.elapsed());
         print_retry_stats(engine.client());
         check_summary(&summary)?;
     } else {
@@ -201,11 +203,19 @@ fn resolve_credential(loc: &BlobLocation) -> Result<Credential> {
     Credential::resolve_or_anonymous(&loc.account, loc.sas_token.as_deref())
 }
 
-fn print_summary(op: &str, s: &TransferSummary) {
+fn print_summary(op: &str, s: &TransferSummary, elapsed: std::time::Duration) {
+    let secs = elapsed.as_secs_f64();
+    let gbps = if secs > 0.0 {
+        (s.total_bytes as f64 * 8.0) / (secs * 1e9)
+    } else {
+        0.0
+    };
     println!(
-        "\n{op} complete: {} files, {}",
+        "\n{op} complete: {} files, {} in {:.1}s = {:.2} Gbps",
         s.total_files,
-        humansize::format_size(s.total_bytes, humansize::BINARY)
+        humansize::format_size(s.total_bytes, humansize::BINARY),
+        secs,
+        gbps
     );
     println!("  Succeeded: {}", s.succeeded);
     if s.failed > 0 {
@@ -229,4 +239,29 @@ fn print_retry_stats(client: &BlobClient) {
     } else {
         println!("  Retries:   none");
     }
+
+    let l = client.latency_stats();
+    let count = l.count.load(std::sync::atomic::Ordering::Relaxed);
+    if count == 0 {
+        return;
+    }
+    let sum_us = l.sum_us.load(std::sync::atomic::Ordering::Relaxed);
+    let min_us = l.min_us.load(std::sync::atomic::Ordering::Relaxed);
+    let max_us = l.max_us.load(std::sync::atomic::Ordering::Relaxed);
+    let bytes = l.bytes.load(std::sync::atomic::Ordering::Relaxed);
+    let mean_ms = (sum_us as f64) / (count as f64) / 1000.0;
+    let min_ms = (min_us as f64) / 1000.0;
+    let max_ms = (max_us as f64) / 1000.0;
+    let p50 = l.percentile_ms(0.50);
+    let p95 = l.percentile_ms(0.95);
+    let p99 = l.percentile_ms(0.99);
+    let avg_bytes_per_req = (bytes as f64) / (count as f64);
+    let avg_per_req_mbps = (avg_bytes_per_req * 8.0) / ((mean_ms / 1000.0) * 1e6);
+    println!(
+        "  Latency:   count={count} mean={mean_ms:.1}ms min={min_ms:.1}ms max={max_ms:.1}ms p50<={p50}ms p95<={p95}ms p99<={p99}ms"
+    );
+    println!(
+        "  Per-req:   {} avg/req @ {avg_per_req_mbps:.0} Mbps/req",
+        humansize::format_size(avg_bytes_per_req as u64, humansize::BINARY)
+    );
 }

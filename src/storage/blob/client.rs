@@ -30,12 +30,94 @@ impl RetryStats {
     }
 }
 
+// Power-of-2 ms histogram buckets; index i covers (2^(i-1), 2^i] ms,
+// bucket 0 covers [0, 1] ms, bucket 15 covers (16384 ms, +inf).
+#[derive(Debug)]
+pub struct LatencyStats {
+    pub count: AtomicU64,
+    pub sum_us: AtomicU64,
+    pub min_us: AtomicU64,
+    pub max_us: AtomicU64,
+    pub bytes: AtomicU64,
+    pub buckets: [AtomicU64; 16],
+}
+
+impl Default for LatencyStats {
+    fn default() -> Self {
+        Self {
+            count: AtomicU64::new(0),
+            sum_us: AtomicU64::new(0),
+            min_us: AtomicU64::new(u64::MAX),
+            max_us: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+            buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
+}
+
+impl LatencyStats {
+    pub fn record(&self, dur_us: u64, bytes: u64) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.sum_us.fetch_add(dur_us, Ordering::Relaxed);
+        self.bytes.fetch_add(bytes, Ordering::Relaxed);
+        let dur_ms = dur_us / 1000;
+        let bucket = if dur_ms == 0 {
+            0usize
+        } else {
+            ((64 - dur_ms.leading_zeros()) as usize).min(15)
+        };
+        self.buckets[bucket].fetch_add(1, Ordering::Relaxed);
+        let mut cur = self.min_us.load(Ordering::Relaxed);
+        while dur_us < cur {
+            match self.min_us.compare_exchange_weak(
+                cur,
+                dur_us,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(c) => cur = c,
+            }
+        }
+        let mut cur = self.max_us.load(Ordering::Relaxed);
+        while dur_us > cur {
+            match self.max_us.compare_exchange_weak(
+                cur,
+                dur_us,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(c) => cur = c,
+            }
+        }
+    }
+
+    pub fn percentile_ms(&self, p: f64) -> u64 {
+        let counts: [u64; 16] = std::array::from_fn(|i| self.buckets[i].load(Ordering::Relaxed));
+        let total: u64 = counts.iter().sum();
+        if total == 0 {
+            return 0;
+        }
+        let target = ((total as f64) * p).ceil() as u64;
+        let mut acc = 0u64;
+        for (i, c) in counts.iter().enumerate() {
+            acc += c;
+            if acc >= target {
+                return if i == 0 { 1 } else { 1u64 << i };
+            }
+        }
+        u64::MAX
+    }
+}
+
 #[derive(Clone)]
 pub struct BlobClient {
     http: Client,
     credential: Credential,
     max_retries: u32,
     retry_stats: Arc<RetryStats>,
+    latency_stats: Arc<LatencyStats>,
 }
 
 impl BlobClient {
@@ -58,11 +140,16 @@ impl BlobClient {
             credential,
             max_retries,
             retry_stats: Arc::new(RetryStats::default()),
+            latency_stats: Arc::new(LatencyStats::default()),
         })
     }
 
     pub fn retry_stats(&self) -> Arc<RetryStats> {
         self.retry_stats.clone()
+    }
+
+    pub fn latency_stats(&self) -> Arc<LatencyStats> {
+        self.latency_stats.clone()
     }
 
     pub async fn list_containers(&self, account: &str) -> Result<Vec<ContainerItem>> {
@@ -390,6 +477,7 @@ impl BlobClient {
         let url =
             Url::parse(&url_str).map_err(|e| AzcpError::InvalidUrl(e.to_string()))?;
 
+        let started = std::time::Instant::now();
         let resp = self.send(Method::GET, url, &[], None, None).await?;
         let status = resp.status();
 
@@ -398,7 +486,10 @@ impl BlobClient {
             return Err(parse_error(status, &body));
         }
 
-        Ok(resp.bytes().await?)
+        let bytes = resp.bytes().await?;
+        let elapsed_us = started.elapsed().as_micros() as u64;
+        self.latency_stats.record(elapsed_us, bytes.len() as u64);
+        Ok(bytes)
     }
 
     pub async fn get_blob_range(
@@ -420,6 +511,7 @@ impl BlobClient {
             HeaderValue::from_str(&range_val).unwrap(),
         )];
 
+        let started = std::time::Instant::now();
         let resp = self.send(Method::GET, url, &extra, None, None).await?;
         let status = resp.status();
 
@@ -428,7 +520,10 @@ impl BlobClient {
             return Err(parse_error(status, &body));
         }
 
-        Ok(resp.bytes().await?)
+        let bytes = resp.bytes().await?;
+        let elapsed_us = started.elapsed().as_micros() as u64;
+        self.latency_stats.record(elapsed_us, bytes.len() as u64);
+        Ok(bytes)
     }
 
     pub async fn get_blob_properties(
