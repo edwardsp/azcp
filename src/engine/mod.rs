@@ -33,6 +33,7 @@ pub struct TransferEngine {
     // multiple files race for those permits in parallel - removing the
     // file-by-file dispatch bottleneck.
     file_semaphore: Arc<Semaphore>,
+    shared_progress: Option<Arc<TransferProgress>>,
 }
 
 #[derive(Debug, Clone)]
@@ -57,7 +58,13 @@ impl TransferEngine {
             exclude,
             semaphore,
             file_semaphore,
+            shared_progress: None,
         })
+    }
+
+    pub fn with_shared_progress(mut self, progress: Arc<TransferProgress>) -> Self {
+        self.shared_progress = Some(progress);
+        self
     }
 
     pub fn client(&self) -> &BlobClient {
@@ -387,12 +394,20 @@ impl TransferEngine {
             });
         }
 
-        let progress = Arc::new(TransferProgress::new(
-            total_files,
-            total_bytes,
-            self.config.progress,
-        ));
-        progress.attach_retry_stats(self.client.retry_stats());
+        let progress = if let Some(p) = &self.shared_progress {
+            p.add_total(total_files, total_bytes);
+            p.attach_retry_stats(self.client.retry_stats());
+            p.clone()
+        } else {
+            let p = Arc::new(TransferProgress::new(
+                total_files,
+                total_bytes,
+                self.config.progress,
+            ));
+            p.attach_retry_stats(self.client.retry_stats());
+            p
+        };
+        let owns_progress = self.shared_progress.is_none();
         let mut file_tasks: JoinSet<(String, Result<()>)> = JoinSet::new();
         let block_size = self.config.block_size;
         let check_md5 = self.config.check_md5;
@@ -609,7 +624,7 @@ impl TransferEngine {
             }
         }
 
-        progress.finish();
+        if owns_progress { progress.finish(); }
 
         Ok(TransferSummary {
             total_files,
@@ -675,12 +690,20 @@ impl TransferEngine {
             });
         }
 
-        let progress = Arc::new(TransferProgress::new(
-            total_files,
-            total_bytes,
-            self.config.progress,
-        ));
-        progress.attach_retry_stats(self.client.retry_stats());
+        let progress = if let Some(p) = &self.shared_progress {
+            p.add_total(total_files, total_bytes);
+            p.attach_retry_stats(self.client.retry_stats());
+            p.clone()
+        } else {
+            let p = Arc::new(TransferProgress::new(
+                total_files,
+                total_bytes,
+                self.config.progress,
+            ));
+            p.attach_retry_stats(self.client.retry_stats());
+            p
+        };
+        let owns_progress = self.shared_progress.is_none();
         let mut file_tasks: JoinSet<(String, Result<()>)> = JoinSet::new();
         let block_size = self.config.block_size;
         let check_md5 = self.config.check_md5;
@@ -868,7 +891,7 @@ impl TransferEngine {
             }
         }
 
-        progress.finish();
+        if owns_progress { progress.finish(); }
 
         Ok(TransferSummary {
             total_files,

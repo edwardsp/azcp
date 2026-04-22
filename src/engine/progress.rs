@@ -8,10 +8,12 @@ use crate::storage::blob::client::RetryStats;
 pub struct TransferProgress {
     multi: Arc<MultiProgress>,
     total_bar: ProgressBar,
-    total_files: u64,
+    total_files: AtomicU64,
     files_done: AtomicU64,
+    total_bytes: AtomicU64,
     enabled: bool,
     retry_stats: std::sync::Mutex<Option<Arc<RetryStats>>>,
+    refresh_started: std::sync::atomic::AtomicBool,
 }
 
 impl TransferProgress {
@@ -41,10 +43,21 @@ impl TransferProgress {
         Self {
             multi,
             total_bar,
-            total_files,
+            total_files: AtomicU64::new(total_files),
             files_done: AtomicU64::new(0),
+            total_bytes: AtomicU64::new(total_bytes),
             enabled,
             retry_stats: std::sync::Mutex::new(None),
+            refresh_started: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    pub fn add_total(&self, files: u64, bytes: u64) {
+        self.total_files.fetch_add(files, Ordering::Relaxed);
+        let new_bytes = self.total_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        if self.enabled {
+            self.total_bar.set_length(new_bytes.max(1));
+            self.refresh_message();
         }
     }
 
@@ -53,6 +66,12 @@ impl TransferProgress {
             return;
         }
         *self.retry_stats.lock().unwrap() = Some(stats.clone());
+        if self
+            .refresh_started
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
         let this = Arc::clone(self);
         // Refresh the total-bar message every 250ms so throttle counts appear
         // in near-real-time even during long single-file uploads where
@@ -97,7 +116,8 @@ impl TransferProgress {
 
     fn refresh_message(&self) {
         let done = self.files_done.load(Ordering::Relaxed);
-        let base = format!("{}/{} files", done, self.total_files);
+        let total = self.total_files.load(Ordering::Relaxed);
+        let base = format!("{}/{} files", done, total);
         let stats_suffix: String = self
             .retry_stats
             .lock()

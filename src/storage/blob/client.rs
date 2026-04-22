@@ -126,6 +126,24 @@ impl BlobClient {
     }
 
     pub fn with_max_retries(credential: Credential, max_retries: u32) -> Result<Self> {
+        Self::build(credential, max_retries, None, None)
+    }
+
+    pub fn with_shared_stats(
+        credential: Credential,
+        max_retries: u32,
+        retry_stats: Arc<RetryStats>,
+        latency_stats: Arc<LatencyStats>,
+    ) -> Result<Self> {
+        Self::build(credential, max_retries, Some(retry_stats), Some(latency_stats))
+    }
+
+    fn build(
+        credential: Credential,
+        max_retries: u32,
+        retry_stats: Option<Arc<RetryStats>>,
+        latency_stats: Option<Arc<LatencyStats>>,
+    ) -> Result<Self> {
         // HTTP/2 multiplexes all requests onto a single TCP connection, which
         // caps per-connection receive bandwidth on Azure Blob (~25 Gbps
         // observed). HTTP/1.1 lets the pool spread traffic across many
@@ -139,8 +157,8 @@ impl BlobClient {
             http,
             credential,
             max_retries,
-            retry_stats: Arc::new(RetryStats::default()),
-            latency_stats: Arc::new(LatencyStats::default()),
+            retry_stats: retry_stats.unwrap_or_else(|| Arc::new(RetryStats::default())),
+            latency_stats: latency_stats.unwrap_or_else(|| Arc::new(LatencyStats::default())),
         })
     }
 

@@ -6,12 +6,26 @@ use crate::config::TransferConfig;
 use crate::engine::progress::TransferProgress;
 use crate::engine::{TransferEngine, TransferSummary};
 use crate::error::{AzcpError, Result};
-use crate::storage::blob::client::BlobClient;
+use crate::storage::blob::client::{BlobClient, LatencyStats, RetryStats};
 use crate::storage::location::{self, BlobLocation, Location};
 
 use super::args::CopyArgs;
 
+#[derive(Clone, Default)]
+pub struct SharedTransfer {
+    pub progress: Option<Arc<TransferProgress>>,
+    pub retry_stats: Option<Arc<RetryStats>>,
+    pub latency_stats: Option<Arc<LatencyStats>>,
+}
+
 pub async fn run(args: &CopyArgs) -> Result<()> {
+    run_with_shared(args, SharedTransfer::default()).await.map(|_| ())
+}
+
+pub async fn run_with_shared(
+    args: &CopyArgs,
+    shared: SharedTransfer,
+) -> Result<Option<TransferSummary>> {
     let source = location::parse_location(&args.source)?;
     let dest = location::parse_location(&args.destination)?;
 
@@ -38,16 +52,18 @@ pub async fn run(args: &CopyArgs) -> Result<()> {
                     "--discard is only valid for downloads (blob -> local)".into(),
                 ));
             }
-            upload(src, dst, config).await
+            upload(src, dst, config, shared).await
         }
-        (Location::AzureBlob(src), Location::Local(dst)) => download(src, dst, config).await,
+        (Location::AzureBlob(src), Location::Local(dst)) => {
+            download(src, dst, config, shared).await
+        }
         (Location::AzureBlob(_), Location::AzureBlob(_)) => {
             eprintln!("Server-to-server copy not yet implemented.");
-            Ok(())
+            Ok(None)
         }
         (Location::Local(_), Location::Local(_)) => {
             eprintln!("Local-to-local copy not supported. Use cp.");
-            Ok(())
+            Ok(None)
         }
     }
 }
@@ -66,10 +82,15 @@ async fn upload(
     source: &str,
     dest: &BlobLocation,
     config: TransferConfig,
-) -> Result<()> {
+    shared: SharedTransfer,
+) -> Result<Option<TransferSummary>> {
     let credential = resolve_credential(dest)?;
-    let client = BlobClient::with_max_retries(credential, config.max_retries)?;
-    let engine = Arc::new(TransferEngine::new(client, config)?);
+    let client = build_client(credential, config.max_retries, &shared)?;
+    let mut engine = TransferEngine::new(client, config)?;
+    if let Some(p) = &shared.progress {
+        engine = engine.with_shared_progress(p.clone());
+    }
+    let engine = Arc::new(engine);
 
     let src_path = Path::new(source);
 
@@ -78,9 +99,12 @@ async fn upload(
         let summary = engine
             .upload_directory(src_path, &dest.account, &dest.container, &dest.path)
             .await?;
-        print_summary("Upload", &summary, started.elapsed());
-        print_retry_stats(engine.client());
+        if shared.progress.is_none() {
+            print_summary("Upload", &summary, started.elapsed());
+            print_retry_stats(engine.client());
+        }
         check_summary(&summary)?;
+        Ok(Some(summary))
     } else if src_path.is_file() {
         let blob_path = if dest.path.is_empty() {
             src_path
@@ -121,21 +145,26 @@ async fn upload(
             }
             Err(e) => return Err(e),
         }
+        Ok(None)
     } else {
         eprintln!("Source not found: {source}");
+        Ok(None)
     }
-
-    Ok(())
 }
 
 async fn download(
     source: &BlobLocation,
     dest: &str,
     config: TransferConfig,
-) -> Result<()> {
+    shared: SharedTransfer,
+) -> Result<Option<TransferSummary>> {
     let credential = resolve_credential(source)?;
-    let client = BlobClient::with_max_retries(credential, config.max_retries)?;
-    let engine = Arc::new(TransferEngine::new(client, config)?);
+    let client = build_client(credential, config.max_retries, &shared)?;
+    let mut engine = TransferEngine::new(client, config)?;
+    if let Some(p) = &shared.progress {
+        engine = engine.with_shared_progress(p.clone());
+    }
+    let engine = Arc::new(engine);
 
     let dest_path = Path::new(dest);
 
@@ -149,9 +178,12 @@ async fn download(
                 dest_path,
             )
             .await?;
-        print_summary("Download", &summary, started.elapsed());
-        print_retry_stats(engine.client());
+        if shared.progress.is_none() {
+            print_summary("Download", &summary, started.elapsed());
+            print_retry_stats(engine.client());
+        }
         check_summary(&summary)?;
+        Ok(Some(summary))
     } else {
         let file_name = Path::new(&source.path)
             .file_name()
@@ -194,16 +226,28 @@ async fn download(
             local_path.display(),
             humansize::format_size(size, humansize::BINARY)
         );
+        Ok(None)
     }
+}
 
-    Ok(())
+fn build_client(
+    credential: Credential,
+    max_retries: u32,
+    shared: &SharedTransfer,
+) -> Result<BlobClient> {
+    match (&shared.retry_stats, &shared.latency_stats) {
+        (Some(r), Some(l)) => {
+            BlobClient::with_shared_stats(credential, max_retries, r.clone(), l.clone())
+        }
+        _ => BlobClient::with_max_retries(credential, max_retries),
+    }
 }
 
 fn resolve_credential(loc: &BlobLocation) -> Result<Credential> {
     Credential::resolve_or_anonymous(&loc.account, loc.sas_token.as_deref())
 }
 
-fn print_summary(op: &str, s: &TransferSummary, elapsed: std::time::Duration) {
+pub fn print_summary(op: &str, s: &TransferSummary, elapsed: std::time::Duration) {
     let secs = elapsed.as_secs_f64();
     let gbps = if secs > 0.0 {
         (s.total_bytes as f64 * 8.0) / (secs * 1e9)
@@ -227,7 +271,11 @@ fn print_summary(op: &str, s: &TransferSummary, elapsed: std::time::Duration) {
 }
 
 fn print_retry_stats(client: &BlobClient) {
-    let s = client.retry_stats();
+    print_stats(&client.retry_stats(), &client.latency_stats());
+}
+
+pub fn print_stats(retry: &RetryStats, latency: &LatencyStats) {
+    let s = retry;
     let t503 = s.throttle_503.load(std::sync::atomic::Ordering::Relaxed);
     let t429 = s.throttle_429.load(std::sync::atomic::Ordering::Relaxed);
     let t5xx = s.server_5xx.load(std::sync::atomic::Ordering::Relaxed);
@@ -240,7 +288,7 @@ fn print_retry_stats(client: &BlobClient) {
         println!("  Retries:   none");
     }
 
-    let l = client.latency_stats();
+    let l = latency;
     let count = l.count.load(std::sync::atomic::Ordering::Relaxed);
     if count == 0 {
         return;

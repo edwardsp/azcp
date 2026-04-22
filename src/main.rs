@@ -1,9 +1,15 @@
+use std::sync::Arc;
+
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 use azcp::cli;
 use azcp::cli::args::{Cli, Command, CopyArgs};
+use azcp::cli::copy::SharedTransfer;
+use azcp::engine::progress::TransferProgress;
+use azcp::engine::TransferSummary;
 use azcp::error::Result;
+use azcp::storage::blob::client::{LatencyStats, RetryStats};
 
 #[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
 #[global_allocator]
@@ -81,32 +87,54 @@ fn run_workers(args: &CopyArgs) -> Result<()> {
     }
     eprintln!("[workers] spawning {n} independent runtimes");
 
+    let shared_progress = Arc::new(TransferProgress::new(0, 0, args.progress));
+    let shared_retry = Arc::new(RetryStats::default());
+    let shared_latency = Arc::new(LatencyStats::default());
+
+    let started = std::time::Instant::now();
+
     let handles: Vec<_> = (0..n)
         .map(|i| {
             let mut a = args.clone();
             a.shard = Some((i, n));
             a.workers = 1;
-            if n > 1 {
-                a.progress = false;
-            }
+            let shared = SharedTransfer {
+                progress: Some(shared_progress.clone()),
+                retry_stats: Some(shared_retry.clone()),
+                latency_stats: Some(shared_latency.clone()),
+            };
             std::thread::Builder::new()
                 .name(format!("azcp-w{i}"))
-                .spawn(move || -> Result<()> {
+                .spawn(move || -> Result<Option<TransferSummary>> {
                     let rt = tokio::runtime::Builder::new_multi_thread()
                         .enable_all()
                         .thread_name(format!("azcp-w{i}-rt"))
                         .build()
                         .expect("build worker runtime");
-                    rt.block_on(cli::copy::run(&a))
+                    rt.block_on(cli::copy::run_with_shared(&a, shared))
                 })
                 .expect("spawn worker thread")
         })
         .collect();
 
     let mut first_err: Option<azcp::error::AzcpError> = None;
+    let mut combined = TransferSummary {
+        total_files: 0,
+        total_bytes: 0,
+        succeeded: 0,
+        failed: 0,
+        skipped: 0,
+    };
     for (i, h) in handles.into_iter().enumerate() {
         match h.join() {
-            Ok(Ok(())) => {}
+            Ok(Ok(Some(s))) => {
+                combined.total_files += s.total_files;
+                combined.total_bytes += s.total_bytes;
+                combined.succeeded += s.succeeded;
+                combined.failed += s.failed;
+                combined.skipped += s.skipped;
+            }
+            Ok(Ok(None)) => {}
             Ok(Err(e)) => {
                 eprintln!("[workers] worker {i} failed: {e}");
                 if first_err.is_none() {
@@ -123,6 +151,11 @@ fn run_workers(args: &CopyArgs) -> Result<()> {
             }
         }
     }
+
+    shared_progress.finish();
+
+    cli::copy::print_summary("Transfer", &combined, started.elapsed());
+    cli::copy::print_stats(&shared_retry, &shared_latency);
 
     match first_err {
         Some(e) => Err(e),
