@@ -11,7 +11,7 @@
 
 ARG OPENMPI_VERSION=4.1.6
 ARG UCX_VERSION=1.15.0
-ARG RUST_VERSION=1.83
+ARG RUST_VERSION=1.85
 
 ############################
 # Stage 1: build OpenMPI + UCX (per target arch)
