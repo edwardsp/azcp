@@ -1,53 +1,57 @@
 # AKS smoke test for `azcp-cluster`
 
-End-to-end validation of `azcp-cluster` against the 400 GB DeepSeek model in
-the `paulgb300models` storage account on a 2-node AKS cluster.
+End-to-end validation of `azcp-cluster` against a large model in an Azure
+storage account on a 2-node AKS cluster.
 
 ## Prerequisites
 
 - `kubectl` already configured for the target AKS cluster.
-- `az` CLI logged into the subscription that owns `paulgb300models`.
+- `az` CLI logged into the subscription that owns the storage account.
 - The cluster image has been built and pushed by the `cluster-image` GitHub
   workflow (or built and pushed manually). Note the tag, e.g. `edge`.
 - Two nodes in the cluster have an NVMe (or fast local SSD) mounted at
-  `/mnt/nvme` with at least 500 GB free.
+  `/mnt/nvme` with at least 1.5x the dataset size free.
+- The kubelet's user-assigned managed identity has **Storage Blob Data
+  Reader** on the source account. Recommended over SAS: SAS tokens expire
+  mid-run on long downloads, identity does not.
 
-## 1. Open the storage account to public network access
+## 1. (Optional) Open the storage account to public network access
 
-`paulgb300models` is private by default. Open it temporarily for the test:
+If the source account has `publicNetworkAccess=Disabled`, open it for the
+test. Skip if the account is already reachable from the AKS node subnet
+(e.g. private endpoint or service endpoint).
 
 ```bash
 az storage account update \
-  --name paulgb300models \
-  --public-network-access Enabled
+  --name <account> \
+  --public-network-access Enabled \
+  --default-action Allow
 ```
 
-> **Re-disable in step 6.** Do not leave this open after the test.
+> **Re-secure in step 6.** Do not leave a model account open after the test.
 
-## 2. Generate a SAS token for the container
-
-Replace `<container>` with the container hosting the DeepSeek model.
+## 2. Find the kubelet's managed identity client ID
 
 ```bash
-EXPIRY=$(date -u -d '+2 hour' '+%Y-%m-%dT%H:%MZ')
-SAS=$(az storage container generate-sas \
-  --account-name paulgb300models \
-  --name <container> \
-  --permissions rl \
-  --expiry "$EXPIRY" \
-  --auth-mode login --as-user \
-  -o tsv)
-echo "$SAS"
+az aks show -g <rg> -n <cluster> \
+  --query "identityProfile.kubeletidentity.clientId" -o tsv
 ```
 
-Create a Secret holding it:
+Confirm it has `Storage Blob Data Reader` on the source account; grant if
+not:
 
 ```bash
-kubectl create secret generic azcp-cluster-test-sas \
-  --from-literal=sas="?$SAS"
+ACCOUNT_ID=$(az storage account show -n <account> --query id -o tsv)
+az role assignment create \
+  --assignee <kubelet-client-id> \
+  --role "Storage Blob Data Reader" \
+  --scope "$ACCOUNT_ID"
 ```
 
 ## 3. Generate an ephemeral SSH keypair for the pods
+
+`mpirun` on rank 0 sshes into rank 1 to launch `orted`. The pods need a
+shared keypair for that.
 
 ```bash
 TMP=$(mktemp -d)
@@ -64,13 +68,16 @@ rm -rf "$TMP"
 
 Edit `k8s/azcp-cluster-test.yaml`:
 
-- Replace `ghcr.io/REPLACE_WITH_OWNER/azcp/azcp-cluster:edge` with the actual
-  image reference produced by the `cluster-image` workflow.
-- Replace `REPLACE_WITH_CONTAINER/REPLACE_WITH_PREFIX/` in `SOURCE_URL` with
-  the container + prefix that holds the DeepSeek model. Keep the trailing
-  slash.
+- Replace `ghcr.io/REPLACE_WITH_OWNER/azcp/azcp-cluster:edge` with the
+  actual image reference produced by the `cluster-image` workflow.
+- Replace `REPLACE_WITH_ACCOUNT`, `REPLACE_WITH_CONTAINER`,
+  `REPLACE_WITH_PREFIX` in `SOURCE_URL` with the source location. Keep the
+  trailing slash on the prefix.
+- Replace `REPLACE_WITH_KUBELET_CLIENT_ID` with the value from step 2.
+- Replace `REPLACE_WITH_NODEPOOL` in `nodeSelector.agentpool` with the pool
+  whose nodes have `/mnt/nvme` provisioned.
 - Remove the placeholder `azcp-cluster-test-sshkey` Secret block at the top
-  of the file (you already created the real one in step 3).
+  of the file (the real one was created in step 3).
 
 Deploy:
 
@@ -81,12 +88,19 @@ kubectl rollout status statefulset/azcp-cluster-test --timeout=5m
 
 ## 5. Wait for the launcher pod and verify
 
-Pod 0 launches `mpirun` once both pods' sshd is up; pod 1 just runs sshd and
-waits to receive bcast traffic. Watch pod 0:
+Pod 0 launches `mpirun` once both pods' sshd is up; pod 1 just runs sshd
+and waits to receive bcast traffic.
+
+It is normal for `azcp-cluster-test-0` to go through 1-3 `CrashLoopBackOff`
+cycles at the start while it waits for `azcp-cluster-test-1`'s sshd to
+become reachable. Watch:
 
 ```bash
 kubectl logs -f azcp-cluster-test-0
 ```
+
+Note: `mpirun` output appears only in the launching rank's container logs.
+`azcp-cluster-test-1`'s logs only show sshd activity — that is expected.
 
 Expected: a `[shard]` line per rank, then six summary lines on rank 0:
 
@@ -121,11 +135,20 @@ The two md5s must be identical.
 
 ```bash
 kubectl delete -f k8s/azcp-cluster-test.yaml
-kubectl delete secret azcp-cluster-test-sas azcp-cluster-test-sshkey
+kubectl delete secret azcp-cluster-test-sshkey
 
+# Wipe the NVMe scratch on each node (the StatefulSet leaves it behind).
+# Use `kubectl debug` to reach the host filesystem.
+for node in $(kubectl get nodes -l agentpool=<pool> -o name); do
+  kubectl debug "$node" --image=busybox --profile=sysadmin -it -- \
+    chroot /host rm -rf /mnt/nvme/deepseek
+done
+
+# Re-secure the account if you opened it in step 1.
 az storage account update \
-  --name paulgb300models \
-  --public-network-access Disabled
+  --name <account> \
+  --public-network-access Disabled \
+  --default-action Deny
 ```
 
 ## Pass criteria
@@ -136,17 +159,69 @@ az storage account update \
   (aggregate). This proves the fabric path is faster than per-node Azure
   egress, which is the whole point of `azcp-cluster`.
 
+## Skip-on-rerun check (optional)
+
+The StatefulSet's `restartPolicy: Always` means the pod restarts after
+rank 0 exits 0. The second iteration should produce:
+
+```
+[diff]     0 to transfer, 524 skipped
+[download] 0 bytes T=0.00s
+[bcast]    0 files 0 bytes
+[total]    T=<<1s
+```
+
+This validates `--compare size` correctly skips already-present files.
+
+## Gotchas
+
+This section captures non-obvious things learned wiring this up. The
+manifest already accounts for all of these — they are documented so future
+edits don't regress them.
+
+- **`hostNetwork: true` collides with the node's real sshd on port 22.**
+  The pod's in-container sshd must bind a different port (we use 2222),
+  and the SSH client config + `sshd_config` must both agree on it. The
+  Service's port number is just a label and can stay 22.
+- **`/run/sshd` must exist** before launching `sshd -D`, otherwise it
+  exits immediately with "Missing privilege separation directory". The
+  entrypoint creates it.
+- **`hostname` returns the node name on hostNetwork pods**, not the pod
+  name, so rank detection by `hostname` is broken. The entrypoint uses a
+  downward-API `POD_NAME` env instead.
+- **Open MPI's ORTE handles FQDNs poorly on hostNetwork pods.** Passing
+  `-hostfile` with the StatefulSet pod-FQDNs causes orted launch failures.
+  The entrypoint resolves the FQDNs to IPs locally and passes
+  `--host IP0:1,IP1:1 -mca routed direct` instead.
+- **`orted` on the remote rank can't find Open MPI** because sshd's
+  non-login shell doesn't source `/etc/profile`. `mpirun --prefix
+  /opt/openmpi -x PATH -x LD_LIBRARY_PATH` fixes this. (`/opt/openmpi` is
+  the install prefix in the cluster image; adjust if you change the
+  Dockerfile.)
+- **`mpirun` output only appears in the launching rank's logs.** Rank 1's
+  pod logs only show sshd. To see what the remote rank's `azcp-cluster`
+  printed, look at rank 0's logs (where mpirun multiplexes the streams).
+- **Managed identity is preferred over SAS.** SAS tokens generated with
+  `--auth-mode login --as-user` are capped at 24h (often less, depending
+  on tenant policy) and expire mid-transfer on big datasets. Managed
+  identity does not.
+
 ## Troubleshooting
 
 - **Pods stuck in `ContainerCreating` for the SSH secret**: confirm step 3
   created `azcp-cluster-test-sshkey` in the same namespace as the
   StatefulSet.
-- **`mpirun` cannot resolve pod 1's DNS name**: confirm the headless Service
-  exists (`kubectl get svc azcp-cluster-test`); pod DNS resolution depends
-  on it.
-- **`401`/`403` on LIST**: SAS token expired (2 h default in step 2) or
-  insufficient permissions (need `r` and `l`).
+- **`mpirun` cannot resolve pod 1's DNS name**: confirm the headless
+  Service exists (`kubectl get svc azcp-cluster-test`); pod DNS resolution
+  depends on it.
+- **`401`/`403` on LIST**: kubelet identity is missing the
+  `Storage Blob Data Reader` role on the source account, or
+  `AZURE_CLIENT_ID` is wrong / pointed at an identity not attached to the
+  node.
 - **`hostNetwork` privilege denied**: the cluster's PodSecurityPolicy /
   PSA may forbid `hostNetwork: true`. Run in a namespace with the
   `privileged` PSA level, or remove `hostNetwork: true` (will reduce
   throughput but should still functionally work).
+- **Rank 0 `CrashLoopBackOff` early on**: usually benign — rank 0 retries
+  while waiting for rank 1's sshd. If it persists past ~2 minutes, check
+  rank 1's logs for sshd startup errors.

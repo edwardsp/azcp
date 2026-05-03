@@ -34,9 +34,6 @@ kind: ConfigMap
 metadata:
   name: azcp-cluster-test-cfg
 data:
-  hostfile: |
-    azcp-cluster-test-0.azcp-cluster-test slots=1
-    azcp-cluster-test-1.azcp-cluster-test slots=1
   entrypoint.sh: |
     #!/usr/bin/env bash
     set -euo pipefail
@@ -45,18 +42,25 @@ data:
     install -m 0600 /etc/sshkey/id_ed25519     /root/.ssh/id_ed25519
     install -m 0644 /etc/sshkey/id_ed25519.pub /root/.ssh/id_ed25519.pub
     install -m 0600 /etc/sshkey/id_ed25519.pub /root/.ssh/authorized_keys
+    # hostNetwork pods share the host's port 22 with the node's real sshd,
+    # so we run our in-pod sshd on 2222 to avoid the collision.
     cat > /root/.ssh/config <<EOF
     Host *
       StrictHostKeyChecking no
       UserKnownHostsFile /dev/null
       LogLevel ERROR
+      Port 2222
     EOF
 
     ssh-keygen -A
+    install -d -m 0755 /run/sshd
+    sed -i 's/^#\?Port .*/Port 2222/' /etc/ssh/sshd_config
     /usr/sbin/sshd -D -e &
     SSHD_PID=$!
 
-    if [[ "$(hostname)" != "azcp-cluster-test-0" ]]; then
+    # hostNetwork makes `hostname` return the node name, not the pod name,
+    # so we use the downward-API POD_NAME env to detect rank 0.
+    if [[ "${POD_NAME:-$(hostname)}" != "azcp-cluster-test-0" ]]; then
       wait "$SSHD_PID"
       exit 0
     fi
@@ -68,12 +72,23 @@ data:
       done
     done
 
+    # ORTE's FQDN handling is brittle on hostNetwork pods; resolve to IPs
+    # ourselves and pass --host with explicit slots, plus `-mca routed direct`.
+    IP0=$(getent hosts azcp-cluster-test-0.azcp-cluster-test | awk 'NR==1{print $1}')
+    IP1=$(getent hosts azcp-cluster-test-1.azcp-cluster-test | awk 'NR==1{print $1}')
+    echo "RANK_IPS: 0=$IP0 1=$IP1"
+
     mkdir -p /mnt/nvme/deepseek
-    exec mpirun -N 1 -hostfile /etc/mpi/hostfile \
+    # --prefix + -x PATH/LD_LIBRARY_PATH are required so orted on the remote
+    # rank can find Open MPI (sshd's non-login shell does not source profile).
+    exec mpirun --host "${IP0}:1,${IP1}:1" -np 2 \
       --allow-run-as-root \
+      --prefix /opt/openmpi \
       -mca plm_rsh_agent ssh \
       -mca btl_tcp_if_include eth0 \
-      -x AZURE_STORAGE_SAS_TOKEN \
+      -mca routed direct \
+      -x PATH -x LD_LIBRARY_PATH \
+      -x AZURE_CLIENT_ID \
       azcp-cluster \
         "${SOURCE_URL}" /mnt/nvme/deepseek \
         --concurrency 32 --block-size 16777216 --bcast-chunk 67108864 \
@@ -100,20 +115,38 @@ spec:
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       restartPolicy: Always
+      # Pin to the pool whose nodes have NVMe at /mnt/nvme and the kubelet
+      # identity that has Storage Blob Data Reader on the source account.
+      nodeSelector:
+        agentpool: REPLACE_WITH_NODEPOOL
+      tolerations:
+        - operator: Exists
+      affinity:
+        # Force the two replicas onto different nodes so the bcast actually
+        # crosses the fabric (otherwise it's a memcpy and the test is moot).
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: azcp-cluster-test
+              topologyKey: kubernetes.io/hostname
       containers:
         - name: azcp-cluster
           image: ghcr.io/REPLACE_WITH_OWNER/azcp/azcp-cluster:edge
           imagePullPolicy: Always
           command: ["/bin/bash", "/etc/mpi/entrypoint.sh"]
           env:
-            - name: SOURCE_URL
-              value: "https://paulgb300models.blob.core.windows.net/REPLACE_WITH_CONTAINER/REPLACE_WITH_PREFIX/"
-            - name: AZURE_STORAGE_SAS_TOKEN
+            - name: POD_NAME
               valueFrom:
-                secretKeyRef:
-                  name: azcp-cluster-test-sas
-                  key: sas
-                  optional: true
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: SOURCE_URL
+              value: "https://REPLACE_WITH_ACCOUNT.blob.core.windows.net/REPLACE_WITH_CONTAINER/REPLACE_WITH_PREFIX/"
+            # Kubelet user-assigned managed identity client ID (must have
+            # Storage Blob Data Reader on the source account). Set to ""
+            # to fall back to the system-assigned identity.
+            - name: AZURE_CLIENT_ID
+              value: "REPLACE_WITH_KUBELET_CLIENT_ID"
           volumeMounts:
             - name: nvme
               mountPath: /mnt/nvme
@@ -124,10 +157,10 @@ spec:
               readOnly: true
           resources:
             requests:
-              cpu: "4"
-              memory: "8Gi"
-            limits:
+              cpu: "8"
               memory: "16Gi"
+            limits:
+              memory: "64Gi"
       volumes:
         - name: nvme
           hostPath:
