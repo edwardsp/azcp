@@ -19,7 +19,9 @@ pub struct SharedTransfer {
 }
 
 pub async fn run(args: &CopyArgs) -> Result<()> {
-    run_with_shared(args, SharedTransfer::default()).await.map(|_| ())
+    run_with_shared(args, SharedTransfer::default())
+        .await
+        .map(|_| ())
 }
 
 pub async fn run_with_shared(
@@ -113,17 +115,17 @@ async fn upload(
         Ok(Some(summary))
     } else if src_path.is_file() {
         let blob_path = if dest.path.is_empty() {
-            src_path
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .to_string()
+            src_path.file_name().unwrap().to_string_lossy().to_string()
         } else {
             dest.path.clone()
         };
 
         let metadata = std::fs::metadata(src_path)?;
-        let progress = Arc::new(TransferProgress::new(1, metadata.len(), engine.config().progress));
+        let progress = Arc::new(TransferProgress::new(
+            1,
+            metadata.len(),
+            engine.config().progress,
+        ));
         progress.attach_retry_stats(engine.client().retry_stats());
         let pb = progress.create_file_bar(metadata.len());
         pb.set_message(blob_path.clone());
@@ -177,12 +179,7 @@ async fn download(
     if source.path.is_empty() || source.path.ends_with('/') {
         let started = std::time::Instant::now();
         let summary = engine
-            .download_directory(
-                &source.account,
-                &source.container,
-                &source.path,
-                dest_path,
-            )
+            .download_directory(&source.account, &source.container, &source.path, dest_path)
             .await?;
         if shared.progress.is_none() {
             print_summary("Download", &summary, started.elapsed());
@@ -207,7 +204,11 @@ async fn download(
             .get_blob_properties(&source.account, &source.container, &source.path)
             .await?;
 
-        let progress = Arc::new(TransferProgress::new(1, props.content_length, engine.config().progress));
+        let progress = Arc::new(TransferProgress::new(
+            1,
+            props.content_length,
+            engine.config().progress,
+        ));
         progress.attach_retry_stats(engine.client().retry_stats());
         let pb = progress.create_file_bar(props.content_length);
         pb.set_message(source.path.clone());
@@ -287,9 +288,7 @@ pub fn print_stats(retry: &RetryStats, latency: &LatencyStats) {
     let t5xx = s.server_5xx.load(std::sync::atomic::Ordering::Relaxed);
     let txerr = s.transport_err.load(std::sync::atomic::Ordering::Relaxed);
     if t503 + t429 + t5xx + txerr > 0 {
-        println!(
-            "  Retries:   503x{t503} 429x{t429} 5xxx{t5xx} transport-err x{txerr}"
-        );
+        println!("  Retries:   503x{t503} 429x{t429} 5xxx{t5xx} transport-err x{txerr}");
     } else {
         println!("  Retries:   none");
     }

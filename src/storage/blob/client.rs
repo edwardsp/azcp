@@ -135,7 +135,12 @@ impl BlobClient {
         retry_stats: Arc<RetryStats>,
         latency_stats: Arc<LatencyStats>,
     ) -> Result<Self> {
-        Self::build(credential, max_retries, Some(retry_stats), Some(latency_stats))
+        Self::build(
+            credential,
+            max_retries,
+            Some(retry_stats),
+            Some(latency_stats),
+        )
     }
 
     fn build(
@@ -175,13 +180,11 @@ impl BlobClient {
         let mut marker: Option<String> = None;
 
         loop {
-            let mut url_str =
-                format!("https://{account}.blob.core.windows.net/?comp=list");
+            let mut url_str = format!("https://{account}.blob.core.windows.net/?comp=list");
             if let Some(ref m) = marker {
                 url_str.push_str(&format!("&marker={m}"));
             }
-            let url =
-                Url::parse(&url_str).map_err(|e| AzcpError::InvalidUrl(e.to_string()))?;
+            let url = Url::parse(&url_str).map_err(|e| AzcpError::InvalidUrl(e.to_string()))?;
 
             let resp = self.send(Method::GET, url, &[], None, None).await?;
             let status = resp.status();
@@ -190,8 +193,8 @@ impl BlobClient {
                 return Err(parse_error(status, &body));
             }
 
-            let parsed: ContainerListResponse = quick_xml::de::from_str(&body)
-                .map_err(|e| AzcpError::Xml(e.to_string()))?;
+            let parsed: ContainerListResponse =
+                quick_xml::de::from_str(&body).map_err(|e| AzcpError::Xml(e.to_string()))?;
 
             if let Some(containers) = parsed.containers {
                 all.extend(containers.items);
@@ -221,10 +224,8 @@ impl BlobClient {
                 "https://{account}.blob.core.windows.net/{container}?restype=container&comp=list"
             );
             if let Some(p) = prefix {
-                let encoded = percent_encoding::utf8_percent_encode(
-                    p,
-                    percent_encoding::NON_ALPHANUMERIC,
-                );
+                let encoded =
+                    percent_encoding::utf8_percent_encode(p, percent_encoding::NON_ALPHANUMERIC);
                 url_str.push_str(&format!("&prefix={encoded}"));
             }
             if !recursive {
@@ -233,8 +234,7 @@ impl BlobClient {
             if let Some(ref m) = marker {
                 url_str.push_str(&format!("&marker={m}"));
             }
-            let url =
-                Url::parse(&url_str).map_err(|e| AzcpError::InvalidUrl(e.to_string()))?;
+            let url = Url::parse(&url_str).map_err(|e| AzcpError::InvalidUrl(e.to_string()))?;
 
             let resp = self.send(Method::GET, url, &[], None, None).await?;
             let status = resp.status();
@@ -243,8 +243,8 @@ impl BlobClient {
                 return Err(parse_error(status, &body));
             }
 
-            let parsed: BlobListResponse = quick_xml::de::from_str(&body)
-                .map_err(|e| AzcpError::Xml(e.to_string()))?;
+            let parsed: BlobListResponse =
+                quick_xml::de::from_str(&body).map_err(|e| AzcpError::Xml(e.to_string()))?;
 
             if let Some(blobs) = parsed.blobs {
                 for entry in blobs.entries {
@@ -279,10 +279,8 @@ impl BlobClient {
                 "https://{account}.blob.core.windows.net/{container}?restype=container&comp=list"
             );
             if let Some(p) = prefix {
-                let encoded = percent_encoding::utf8_percent_encode(
-                    p,
-                    percent_encoding::NON_ALPHANUMERIC,
-                );
+                let encoded =
+                    percent_encoding::utf8_percent_encode(p, percent_encoding::NON_ALPHANUMERIC);
                 url_str.push_str(&format!("&prefix={encoded}"));
             }
             if !recursive {
@@ -291,8 +289,7 @@ impl BlobClient {
             if let Some(ref m) = marker {
                 url_str.push_str(&format!("&marker={m}"));
             }
-            let url =
-                Url::parse(&url_str).map_err(|e| AzcpError::InvalidUrl(e.to_string()))?;
+            let url = Url::parse(&url_str).map_err(|e| AzcpError::InvalidUrl(e.to_string()))?;
 
             let resp = self.send(Method::GET, url, &[], None, None).await?;
             let status = resp.status();
@@ -301,8 +298,8 @@ impl BlobClient {
                 return Err(parse_error(status, &body));
             }
 
-            let parsed: BlobListResponse = quick_xml::de::from_str(&body)
-                .map_err(|e| AzcpError::Xml(e.to_string()))?;
+            let parsed: BlobListResponse =
+                quick_xml::de::from_str(&body).map_err(|e| AzcpError::Xml(e.to_string()))?;
 
             if let Some(list) = parsed.blobs {
                 for entry in list.entries {
@@ -324,16 +321,10 @@ impl BlobClient {
         Ok((blobs, prefixes))
     }
 
-    pub async fn create_container(
-        &self,
-        account: &str,
-        container: &str,
-    ) -> Result<()> {
-        let url_str = format!(
-            "https://{account}.blob.core.windows.net/{container}?restype=container"
-        );
-        let url =
-            Url::parse(&url_str).map_err(|e| AzcpError::InvalidUrl(e.to_string()))?;
+    pub async fn create_container(&self, account: &str, container: &str) -> Result<()> {
+        let url_str =
+            format!("https://{account}.blob.core.windows.net/{container}?restype=container");
+        let url = Url::parse(&url_str).map_err(|e| AzcpError::InvalidUrl(e.to_string()))?;
 
         let resp = self
             .send(Method::PUT, url, &[], None, Some(Bytes::new()))
@@ -348,16 +339,10 @@ impl BlobClient {
         }
     }
 
-    pub async fn delete_container(
-        &self,
-        account: &str,
-        container: &str,
-    ) -> Result<()> {
-        let url_str = format!(
-            "https://{account}.blob.core.windows.net/{container}?restype=container"
-        );
-        let url =
-            Url::parse(&url_str).map_err(|e| AzcpError::InvalidUrl(e.to_string()))?;
+    pub async fn delete_container(&self, account: &str, container: &str) -> Result<()> {
+        let url_str =
+            format!("https://{account}.blob.core.windows.net/{container}?restype=container");
+        let url = Url::parse(&url_str).map_err(|e| AzcpError::InvalidUrl(e.to_string()))?;
 
         let resp = self.send(Method::DELETE, url, &[], None, None).await?;
         let status = resp.status();
@@ -379,11 +364,8 @@ impl BlobClient {
         content_type: Option<&str>,
         options: &UploadOptions,
     ) -> Result<()> {
-        let url_str = format!(
-            "https://{account}.blob.core.windows.net/{container}/{blob_path}"
-        );
-        let url =
-            Url::parse(&url_str).map_err(|e| AzcpError::InvalidUrl(e.to_string()))?;
+        let url_str = format!("https://{account}.blob.core.windows.net/{container}/{blob_path}");
+        let url = Url::parse(&url_str).map_err(|e| AzcpError::InvalidUrl(e.to_string()))?;
 
         let ct = content_type.unwrap_or("application/octet-stream");
         let extra = build_upload_headers(options);
@@ -411,19 +393,14 @@ impl BlobClient {
         block_id: &str,
         data: Bytes,
     ) -> Result<()> {
-        let encoded_param = percent_encoding::utf8_percent_encode(
-            block_id,
-            percent_encoding::NON_ALPHANUMERIC,
-        );
+        let encoded_param =
+            percent_encoding::utf8_percent_encode(block_id, percent_encoding::NON_ALPHANUMERIC);
         let url_str = format!(
             "https://{account}.blob.core.windows.net/{container}/{blob_path}?comp=block&blockid={encoded_param}"
         );
-        let url =
-            Url::parse(&url_str).map_err(|e| AzcpError::InvalidUrl(e.to_string()))?;
+        let url = Url::parse(&url_str).map_err(|e| AzcpError::InvalidUrl(e.to_string()))?;
 
-        let resp = self
-            .send(Method::PUT, url, &[], None, Some(data))
-            .await?;
+        let resp = self.send(Method::PUT, url, &[], None, Some(data)).await?;
         let status = resp.status();
 
         if status.is_success() {
@@ -446,8 +423,7 @@ impl BlobClient {
         let url_str = format!(
             "https://{account}.blob.core.windows.net/{container}/{blob_path}?comp=blocklist"
         );
-        let url =
-            Url::parse(&url_str).map_err(|e| AzcpError::InvalidUrl(e.to_string()))?;
+        let url = Url::parse(&url_str).map_err(|e| AzcpError::InvalidUrl(e.to_string()))?;
 
         let xml = build_block_list_xml(blocks);
         let body = Bytes::from(xml);
@@ -469,7 +445,13 @@ impl BlobClient {
         }
 
         let resp = self
-            .send(Method::PUT, url, &extra, Some("application/xml"), Some(body))
+            .send(
+                Method::PUT,
+                url,
+                &extra,
+                Some("application/xml"),
+                Some(body),
+            )
             .await?;
         let status = resp.status();
 
@@ -483,17 +465,9 @@ impl BlobClient {
         }
     }
 
-    pub async fn get_blob(
-        &self,
-        account: &str,
-        container: &str,
-        blob_path: &str,
-    ) -> Result<Bytes> {
-        let url_str = format!(
-            "https://{account}.blob.core.windows.net/{container}/{blob_path}"
-        );
-        let url =
-            Url::parse(&url_str).map_err(|e| AzcpError::InvalidUrl(e.to_string()))?;
+    pub async fn get_blob(&self, account: &str, container: &str, blob_path: &str) -> Result<Bytes> {
+        let url_str = format!("https://{account}.blob.core.windows.net/{container}/{blob_path}");
+        let url = Url::parse(&url_str).map_err(|e| AzcpError::InvalidUrl(e.to_string()))?;
 
         let started = std::time::Instant::now();
         let resp = self.send(Method::GET, url, &[], None, None).await?;
@@ -518,16 +492,10 @@ impl BlobClient {
         offset: u64,
         length: u64,
     ) -> Result<Bytes> {
-        let url_str = format!(
-            "https://{account}.blob.core.windows.net/{container}/{blob_path}"
-        );
-        let url =
-            Url::parse(&url_str).map_err(|e| AzcpError::InvalidUrl(e.to_string()))?;
+        let url_str = format!("https://{account}.blob.core.windows.net/{container}/{blob_path}");
+        let url = Url::parse(&url_str).map_err(|e| AzcpError::InvalidUrl(e.to_string()))?;
         let range_val = format!("bytes={}-{}", offset, offset + length - 1);
-        let extra = vec![(
-            "x-ms-range",
-            HeaderValue::from_str(&range_val).unwrap(),
-        )];
+        let extra = vec![("x-ms-range", HeaderValue::from_str(&range_val).unwrap())];
 
         let started = std::time::Instant::now();
         let resp = self.send(Method::GET, url, &extra, None, None).await?;
@@ -550,11 +518,8 @@ impl BlobClient {
         container: &str,
         blob_path: &str,
     ) -> Result<BlobInfo> {
-        let url_str = format!(
-            "https://{account}.blob.core.windows.net/{container}/{blob_path}"
-        );
-        let url =
-            Url::parse(&url_str).map_err(|e| AzcpError::InvalidUrl(e.to_string()))?;
+        let url_str = format!("https://{account}.blob.core.windows.net/{container}/{blob_path}");
+        let url = Url::parse(&url_str).map_err(|e| AzcpError::InvalidUrl(e.to_string()))?;
 
         let resp = self.send(Method::HEAD, url, &[], None, None).await?;
         let status = resp.status();
@@ -583,7 +548,10 @@ impl BlobClient {
                 .get("last-modified")
                 .and_then(|v| v.to_str().ok())
                 .map(String::from),
-            etag: h.get("etag").and_then(|v| v.to_str().ok()).map(String::from),
+            etag: h
+                .get("etag")
+                .and_then(|v| v.to_str().ok())
+                .map(String::from),
             content_md5: h
                 .get("content-md5")
                 .and_then(|v| v.to_str().ok())
@@ -591,17 +559,9 @@ impl BlobClient {
         })
     }
 
-    pub async fn delete_blob(
-        &self,
-        account: &str,
-        container: &str,
-        blob_path: &str,
-    ) -> Result<()> {
-        let url_str = format!(
-            "https://{account}.blob.core.windows.net/{container}/{blob_path}"
-        );
-        let url =
-            Url::parse(&url_str).map_err(|e| AzcpError::InvalidUrl(e.to_string()))?;
+    pub async fn delete_blob(&self, account: &str, container: &str, blob_path: &str) -> Result<()> {
+        let url_str = format!("https://{account}.blob.core.windows.net/{container}/{blob_path}");
+        let url = Url::parse(&url_str).map_err(|e| AzcpError::InvalidUrl(e.to_string()))?;
         let extra = [("x-ms-delete-snapshots", HeaderValue::from_static("include"))];
 
         let resp = self.send(Method::DELETE, url, &extra, None, None).await?;
@@ -666,7 +626,9 @@ impl BlobClient {
                     return Ok(resp);
                 }
                 Err(e) if attempt < max_attempts && is_retryable_transport_err(&e) => {
-                    self.retry_stats.transport_err.fetch_add(1, Ordering::Relaxed);
+                    self.retry_stats
+                        .transport_err
+                        .fetch_add(1, Ordering::Relaxed);
                     let delay = backoff_ms(attempt);
                     tracing::warn!(
                         "retry {attempt}/{max_attempts} transport error={e} sleep={delay}ms"
@@ -682,10 +644,14 @@ impl BlobClient {
     fn record_retry_status(&self, status: StatusCode) {
         match status {
             StatusCode::SERVICE_UNAVAILABLE => {
-                self.retry_stats.throttle_503.fetch_add(1, Ordering::Relaxed);
+                self.retry_stats
+                    .throttle_503
+                    .fetch_add(1, Ordering::Relaxed);
             }
             StatusCode::TOO_MANY_REQUESTS => {
-                self.retry_stats.throttle_429.fetch_add(1, Ordering::Relaxed);
+                self.retry_stats
+                    .throttle_429
+                    .fetch_add(1, Ordering::Relaxed);
             }
             _ => {
                 self.retry_stats.server_5xx.fetch_add(1, Ordering::Relaxed);
@@ -702,9 +668,7 @@ impl BlobClient {
         extra_headers: &[(&'static str, HeaderValue)],
     ) -> Result<HeaderMap> {
         let mut headers = HeaderMap::new();
-        let date = Utc::now()
-            .format("%a, %d %b %Y %H:%M:%S GMT")
-            .to_string();
+        let date = Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string();
 
         headers.insert("x-ms-date", HeaderValue::from_str(&date).unwrap());
         headers.insert("x-ms-version", HeaderValue::from_static(API_VERSION));
@@ -731,17 +695,11 @@ impl BlobClient {
             Credential::SharedKey { account, key } => {
                 let auth =
                     shared_key::sign_request(account, key, method, url, &headers, content_length);
-                headers.insert(
-                    "Authorization",
-                    HeaderValue::from_str(&auth).unwrap(),
-                );
+                headers.insert("Authorization", HeaderValue::from_str(&auth).unwrap());
             }
             Credential::Bearer { token } => {
                 let val = format!("Bearer {token}");
-                headers.insert(
-                    "Authorization",
-                    HeaderValue::from_str(&val).unwrap(),
-                );
+                headers.insert("Authorization", HeaderValue::from_str(&val).unwrap());
             }
             Credential::Sas { .. } | Credential::Anonymous => {}
         }
@@ -827,10 +785,8 @@ fn backoff_ms(attempt: u32) -> u64 {
 }
 
 fn build_upload_headers(options: &UploadOptions) -> Vec<(&'static str, HeaderValue)> {
-    let mut h: Vec<(&'static str, HeaderValue)> = vec![(
-        "x-ms-blob-type",
-        HeaderValue::from_static("BlockBlob"),
-    )];
+    let mut h: Vec<(&'static str, HeaderValue)> =
+        vec![("x-ms-blob-type", HeaderValue::from_static("BlockBlob"))];
     if !options.overwrite {
         h.push(("if-none-match", HeaderValue::from_static("*")));
     }

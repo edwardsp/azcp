@@ -1,0 +1,143 @@
+---
+# Headless service so StatefulSet pods get stable DNS:
+#   azcp-cluster-test-0.azcp-cluster-test, azcp-cluster-test-1.azcp-cluster-test
+apiVersion: v1
+kind: Service
+metadata:
+  name: azcp-cluster-test
+spec:
+  clusterIP: None
+  selector:
+    app: azcp-cluster-test
+  ports:
+    - name: ssh
+      port: 22
+
+---
+# Test-only SSH keypair shared between the two pods. Pod 0 uses the private
+# key to ssh into pod 1; both pods accept the public key. Regenerate before
+# every run (see tests/AKS_TESTING.md).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: azcp-cluster-test-sshkey
+type: Opaque
+stringData:
+  id_ed25519: |
+    REPLACE_WITH_PRIVATE_KEY
+  id_ed25519.pub: |
+    REPLACE_WITH_PUBLIC_KEY
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: azcp-cluster-test-cfg
+data:
+  hostfile: |
+    azcp-cluster-test-0.azcp-cluster-test slots=1
+    azcp-cluster-test-1.azcp-cluster-test slots=1
+  entrypoint.sh: |
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    install -m 0700 -d /root/.ssh
+    install -m 0600 /etc/sshkey/id_ed25519     /root/.ssh/id_ed25519
+    install -m 0644 /etc/sshkey/id_ed25519.pub /root/.ssh/id_ed25519.pub
+    install -m 0600 /etc/sshkey/id_ed25519.pub /root/.ssh/authorized_keys
+    cat > /root/.ssh/config <<EOF
+    Host *
+      StrictHostKeyChecking no
+      UserKnownHostsFile /dev/null
+      LogLevel ERROR
+    EOF
+
+    ssh-keygen -A
+    /usr/sbin/sshd -D -e &
+    SSHD_PID=$!
+
+    if [[ "$(hostname)" != "azcp-cluster-test-0" ]]; then
+      wait "$SSHD_PID"
+      exit 0
+    fi
+
+    for host in azcp-cluster-test-0.azcp-cluster-test azcp-cluster-test-1.azcp-cluster-test; do
+      until ssh -o ConnectTimeout=2 "$host" true 2>/dev/null; do
+        echo "waiting for $host sshd..."
+        sleep 2
+      done
+    done
+
+    mkdir -p /mnt/nvme/deepseek
+    exec mpirun -N 1 -hostfile /etc/mpi/hostfile \
+      --allow-run-as-root \
+      -mca plm_rsh_agent ssh \
+      -mca btl_tcp_if_include eth0 \
+      -x AZURE_STORAGE_SAS_TOKEN \
+      azcp-cluster \
+        "${SOURCE_URL}" /mnt/nvme/deepseek \
+        --concurrency 32 --block-size 16777216 --bcast-chunk 67108864 \
+        --compare size \
+        --no-progress
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: azcp-cluster-test
+spec:
+  serviceName: azcp-cluster-test
+  replicas: 2
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: azcp-cluster-test
+  template:
+    metadata:
+      labels:
+        app: azcp-cluster-test
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      restartPolicy: Always
+      containers:
+        - name: azcp-cluster
+          image: ghcr.io/REPLACE_WITH_OWNER/azcp/azcp-cluster:edge
+          imagePullPolicy: Always
+          command: ["/bin/bash", "/etc/mpi/entrypoint.sh"]
+          env:
+            - name: SOURCE_URL
+              value: "https://paulgb300models.blob.core.windows.net/REPLACE_WITH_CONTAINER/REPLACE_WITH_PREFIX/"
+            - name: AZURE_STORAGE_SAS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: azcp-cluster-test-sas
+                  key: sas
+                  optional: true
+          volumeMounts:
+            - name: nvme
+              mountPath: /mnt/nvme
+            - name: cfg
+              mountPath: /etc/mpi
+            - name: sshkey
+              mountPath: /etc/sshkey
+              readOnly: true
+          resources:
+            requests:
+              cpu: "4"
+              memory: "8Gi"
+            limits:
+              memory: "16Gi"
+      volumes:
+        - name: nvme
+          hostPath:
+            path: /mnt/nvme
+            type: DirectoryOrCreate
+        - name: cfg
+          configMap:
+            name: azcp-cluster-test-cfg
+            defaultMode: 0o755
+        - name: sshkey
+          secret:
+            secretName: azcp-cluster-test-sshkey
+            defaultMode: 0o600
