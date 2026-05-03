@@ -10,6 +10,7 @@ use mpi::traits::*;
 use azcp::BlobItem;
 
 use crate::cli::Args;
+use crate::paths::local_rel;
 
 pub fn run(
     world: &SimpleCommunicator,
@@ -47,7 +48,7 @@ pub fn run(
             .as_ref()
             .and_then(|p| p.content_length)
             .unwrap_or(0);
-        let local_path = args.dest.join(&entry.name);
+        let local_path = args.dest.join(local_rel(&args.source, &entry.name));
 
         let is_owner = owner == rank;
         let already_have_locally = have_local[i] == 1;
@@ -105,7 +106,7 @@ fn local_file_complete(args: &Args, entry: &BlobItem) -> bool {
         Some(s) => s,
         None => return false,
     };
-    let path = args.dest.join(&entry.name);
+    let path = args.dest.join(local_rel(&args.source, &entry.name));
     match std::fs::metadata(&path) {
         Ok(m) => m.is_file() && m.len() == want,
         Err(_) => false,

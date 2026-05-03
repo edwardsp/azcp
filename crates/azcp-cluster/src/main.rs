@@ -1,5 +1,6 @@
 mod cli;
 mod filelist;
+mod paths;
 mod stages;
 mod timing;
 

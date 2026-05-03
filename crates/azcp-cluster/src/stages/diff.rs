@@ -7,6 +7,7 @@ use azcp::BlobItem;
 
 use crate::cli::{Args, Compare};
 use crate::filelist;
+use crate::paths::local_rel;
 
 pub struct Plan {
     pub to_transfer: Vec<BlobItem>,
@@ -28,7 +29,9 @@ pub fn plan(args: &Args, entries: Vec<BlobItem>) -> Result<Plan> {
             skipped: 0,
             to_transfer: entries,
         }),
-        Compare::Size => Ok(filter(entries, |e| size_matches(&args.dest, e))),
+        Compare::Size => Ok(filter(entries, |e| {
+            size_matches(&args.source, &args.dest, e)
+        })),
         Compare::Filelist => {
             let path = args
                 .filelist
@@ -62,7 +65,7 @@ pub fn plan(args: &Args, entries: Vec<BlobItem>) -> Result<Plan> {
                 if live_lm != prior_lm.as_ref() {
                     return false;
                 }
-                size_matches(&args.dest, e)
+                size_matches(&args.source, &args.dest, e)
             }))
         }
     }
@@ -84,12 +87,12 @@ fn filter(entries: Vec<BlobItem>, skip_if: impl Fn(&BlobItem) -> bool) -> Plan {
     }
 }
 
-fn size_matches(dest: &Path, e: &BlobItem) -> bool {
+fn size_matches(source: &str, dest: &Path, e: &BlobItem) -> bool {
     let want = match e.properties.as_ref().and_then(|p| p.content_length) {
         Some(s) => s,
         None => return false,
     };
-    match std::fs::metadata(dest.join(&e.name)) {
+    match std::fs::metadata(dest.join(local_rel(source, &e.name))) {
         Ok(m) => m.is_file() && m.len() == want,
         Err(_) => false,
     }
