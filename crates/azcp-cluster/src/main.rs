@@ -11,6 +11,8 @@ use mpi::environment;
 use mpi::ffi;
 use mpi::traits::*;
 
+use azcp::BlobItem;
+
 use cli::{Args, Stage};
 
 fn main() -> ExitCode {
@@ -87,32 +89,47 @@ fn main() -> ExitCode {
     }
 
     let t0 = environment::time();
-    let plan = match stages::diff::plan(&args, entries.clone()) {
+    let presence = match stages::presence::run(&world, &args, &entries) {
         Ok(p) => p,
         Err(err) => {
-            eprintln!("rank {rank}: diff stage failed: {err:#}");
+            eprintln!("rank {rank}: presence stage failed: {err:#}");
             unsafe { ffi::MPI_Abort(world.as_raw(), 4) };
             return ExitCode::from(4);
         }
     };
+    let classification = stages::diff::classify(&presence);
     let t_diff = environment::time() - t0;
     if rank == 0 {
         println!(
-            "[diff] {} to transfer, {} skipped T={:.2}s",
-            plan.to_transfer.len(),
-            plan.skipped,
+            "[diff] {} to transfer ({} peer, {} azure), {} skipped T={:.2}s",
+            classification.bcast_only.len() + classification.needs_download.len(),
+            classification.bcast_only.len(),
+            classification.needs_download.len(),
+            classification.skipped,
             t_diff
         );
     }
 
-    let owners = stages::owners::compute(&plan.to_transfer, size as usize);
-    let my_entries: Vec<_> = plan
-        .to_transfer
+    let download_entries: Vec<BlobItem> = classification
+        .needs_download
         .iter()
-        .enumerate()
-        .filter(|(i, _)| owners[*i] == rank as usize)
-        .map(|(_, e)| e.clone())
+        .map(|&i| entries[i].clone())
         .collect();
+    let download_owners = stages::owners::compute(&download_entries, size as usize);
+
+    let mut my_entries: Vec<BlobItem> = Vec::new();
+    let mut bcast_plan: Vec<(usize, usize)> =
+        Vec::with_capacity(classification.bcast_only.len() + classification.needs_download.len());
+    for (sub_idx, &file_idx) in classification.needs_download.iter().enumerate() {
+        let owner = download_owners[sub_idx];
+        if owner == rank as usize {
+            my_entries.push(entries[file_idx].clone());
+        }
+        bcast_plan.push((file_idx, owner));
+    }
+    bcast_plan.extend(classification.bcast_only.iter().copied());
+    bcast_plan.sort_by_key(|(idx, _)| *idx);
+
     let my_bytes: u64 = my_entries
         .iter()
         .map(|e| {
@@ -122,11 +139,20 @@ fn main() -> ExitCode {
                 .unwrap_or(0)
         })
         .sum();
-    let transfer_bytes: u64 = plan
-        .to_transfer
+    let download_bytes: u64 = download_entries
         .iter()
         .map(|e| {
             e.properties
+                .as_ref()
+                .and_then(|p| p.content_length)
+                .unwrap_or(0)
+        })
+        .sum();
+    let bcast_bytes: u64 = bcast_plan
+        .iter()
+        .map(|(idx, _)| {
+            entries[*idx]
+                .properties
                 .as_ref()
                 .and_then(|p| p.content_length)
                 .unwrap_or(0)
@@ -152,9 +178,9 @@ fn main() -> ExitCode {
     if rank == 0 {
         println!(
             "[download] {} bytes T={:.2}s BW={}",
-            transfer_bytes,
+            download_bytes,
             t_download,
-            timing::human_bw(transfer_bytes, t_download)
+            timing::human_bw(download_bytes, t_download)
         );
     }
     if matches!(args.stage, Stage::Download) {
@@ -162,7 +188,7 @@ fn main() -> ExitCode {
     }
 
     let t0 = environment::time();
-    if let Err(err) = stages::broadcast::run(&world, &args, &plan.to_transfer, &owners) {
+    if let Err(err) = stages::broadcast::run(&world, &args, &entries, &bcast_plan, &presence) {
         eprintln!("rank {rank}: broadcast stage failed: {err:#}");
         unsafe { ffi::MPI_Abort(world.as_raw(), 6) };
         return ExitCode::from(6);
@@ -171,10 +197,10 @@ fn main() -> ExitCode {
     if rank == 0 {
         println!(
             "[bcast] {} files {} bytes T={:.2}s BW={}",
-            plan.to_transfer.len(),
-            transfer_bytes,
+            bcast_plan.len(),
+            bcast_bytes,
             t_bcast,
-            timing::human_bw(transfer_bytes, t_bcast)
+            timing::human_bw(bcast_bytes, t_bcast)
         );
     }
 
