@@ -70,6 +70,7 @@ FROM --platform=$TARGETPLATFORM debian:bookworm-slim AS runtime
 
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         ca-certificates libnuma1 libibverbs1 librdmacm1 libnl-3-200 libnl-route-3-200 \
+        ibverbs-providers ibverbs-utils iproute2 \
         openssh-client openssh-server \
     && rm -rf /var/lib/apt/lists/*
 
