@@ -78,7 +78,7 @@ COPY --from=mpi-build /opt/openmpi /opt/openmpi
 COPY --from=rust-build /src/target/release/azcp /usr/local/bin/azcp
 COPY --from=rust-build /src/target/release/azcp-cluster /usr/local/bin/azcp-cluster
 
-ENV PATH=/opt/openmpi/bin:/usr/local/bin:$PATH \
+ENV PATH=/opt/openmpi/bin:/opt/ucx/bin:/usr/local/bin:$PATH \
     LD_LIBRARY_PATH=/opt/openmpi/lib:/opt/ucx/lib \
     OMPI_ALLOW_RUN_AS_ROOT=1 \
     OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
