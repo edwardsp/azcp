@@ -437,6 +437,111 @@ spec:
 
 Once a single node is doing 170-200 Gbps, the next ceiling you'll hit is the **storage account egress cap** itself (~230 Gbps observed for a standard general-purpose v2 account, with hard 503 `ServerBusy` storms above that). Scale across multiple accounts or request a quota increase if you need more.
 
+## Cluster broadcast (`azcp-cluster`)
+
+When **many nodes need the same dataset** (e.g. distributed training pulling
+the same model checkpoint), having every node hit Azure independently wastes
+egress and is bottlenecked by per-node Azure throughput. `azcp-cluster` is a
+companion MPI binary that:
+
+1. Shards the dataset across `N` ranks so each rank pulls only `1/N` of the
+   bytes from Azure (size-balanced LPT, same algorithm as `azcp --shard`).
+2. After download, every file is `MPI_Bcast`'d from its owner rank to all
+   other ranks over the cluster fabric (RDMA / InfiniBand if UCX finds it,
+   TCP otherwise).
+
+Net: Azure egress is paid **once per byte** instead of `N` times, and the
+intra-cluster fan-out runs at fabric speed (typically much higher than the
+per-node Azure link). For 10+ nodes on fast NICs with an equally fast or
+faster fabric, end-to-end time drops by **5-10×** vs the naive
+"every-node-downloads-from-Azure" approach.
+
+### Requirements
+
+- One process per node (the binary aborts if it sees more than one rank
+  sharing the same node).
+- An MPI launcher (`mpirun` from Open MPI 4.x is what the shipped image
+  carries). UCX is bundled for RDMA transport.
+- Local fast storage on every node (NVMe recommended) mounted at the same
+  path on all nodes.
+
+### Image
+
+Multi-arch (`linux/amd64`, `linux/arm64`) image is published to GHCR by the
+`cluster-image` workflow:
+
+```
+ghcr.io/<owner>/azcp/azcp-cluster:<tag>
+```
+
+Tags: `latest` and `vX.Y.Z` on releases, `edge` on `main`, branch-sha for PRs.
+
+### CLI
+
+```
+azcp-cluster <SOURCE> <DEST> [flags]
+```
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `--shardlist FILE` | (off) | Skip the LIST API; read pre-generated TSV manifest (same format as `azcp ls --machine-readable`). Saves the LIST round-trip on rank 0 for very large datasets. |
+| `--compare {none,size,filelist}` | `none` | Skip-policy. `none` re-transfers every file. `size` skips files where the local size matches the blob size. `filelist` (requires `--filelist FILE`) skips when local size **and** the blob's `Last-Modified` both match the prior-run filelist. |
+| `--filelist FILE` | — | Required when `--compare filelist`. Prior-run TSV with sizes + `Last-Modified`. |
+| `--save-filelist FILE` | — | After the run, rank 0 writes the post-run TSV to `FILE` for use as the next run's `--filelist`. |
+| `--concurrency N` | 64 | In-flight HTTP block requests per rank (forwarded to the azcp engine). |
+| `--block-size N` | 16 MiB | Block size for downloads. |
+| `--parallel-files N` | 16 | Files actively downloading concurrently per rank. |
+| `--bcast-chunk N` | 64 MiB | Chunk size for `MPI_Bcast`. |
+| `--max-retries N` | 5 | Per-HTTP-request retry budget. |
+| `--no-progress` | — | Disable per-rank progress bars (default: TTY-aware). |
+
+### Stage timing output
+
+On rank 0, `azcp-cluster` always prints exactly six summary lines:
+
+```
+[list]     <files> files, <bytes> bytes T=<sec>s
+[diff]     <to-transfer> to transfer, <skipped> skipped T=<sec>s
+[download] <bytes> bytes T=<sec>s BW=<aggregate>
+[bcast]    <files> files <bytes> bytes T=<sec>s BW=<per-receiver>
+[filelist] (wrote <n> entries | skipped (no --save-filelist)) T=<sec>s
+[total]    T=<sec>s
+```
+
+`[shard]` lines on stderr show per-rank slice sizes (one per rank, useful for
+debugging LPT balance).
+
+### Example: 4-node download of a model checkpoint
+
+```bash
+mpirun -N 1 -hostfile /etc/mpi/hostfile \
+  azcp-cluster \
+    https://acct.blob.core.windows.net/models/llama-405b/ \
+    /mnt/nvme/llama-405b/ \
+    --concurrency 32 --block-size 16777216 --bcast-chunk 67108864 \
+    --compare size \
+    --save-filelist /mnt/nvme/llama-405b.filelist
+```
+
+Subsequent runs against the same dataset can use `--compare filelist
+--filelist /mnt/nvme/llama-405b.filelist` to skip unchanged files at full
+LIST speed, paying neither the Azure download nor the intra-cluster bcast
+for files that haven't changed.
+
+### Failure semantics
+
+- LIST or any per-rank stage error → `MPI_Abort` with a non-zero exit code
+  (3 = list, 4 = diff, 5 = download, 6 = bcast). The whole job exits.
+- Multiple ranks per node detected → exit code 2 with an explanatory message.
+- Per-file download failures inside a rank's shard surface as a non-zero exit
+  via the existing engine's `Failed: N` summary; the broadcast stage will
+  never run if any rank reports a failed download.
+
+### See also
+
+- [`tests/AKS_TESTING.md`](tests/AKS_TESTING.md) for the AKS smoke-test
+  procedure.
+
 ## Configuration
 
 Environment variables recognized by `azcp`:

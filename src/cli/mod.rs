@@ -27,10 +27,7 @@ fn print_env() {
     let vars = [
         ("AZURE_STORAGE_ACCOUNT", "Storage account name"),
         ("AZURE_STORAGE_KEY", "Storage account key (SharedKey auth)"),
-        (
-            "AZURE_STORAGE_SAS_TOKEN",
-            "SAS token for authentication",
-        ),
+        ("AZURE_STORAGE_SAS_TOKEN", "SAS token for authentication"),
         ("AZCOPY_LOG_LOCATION", "Log file directory"),
         ("AZCOPY_CONCURRENCY_VALUE", "Default concurrency level"),
     ];

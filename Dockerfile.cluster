@@ -1,0 +1,88 @@
+# syntax=docker/dockerfile:1.7
+# Multi-arch (linux/amd64, linux/arm64) image for azcp-cluster.
+#
+# Build:
+#   docker buildx build --platform linux/amd64,linux/arm64 \
+#     -f Dockerfile.cluster -t ghcr.io/<org>/azcp-cluster:<tag> --push .
+#
+# Run inside an MPI-enabled cluster (one rank per node):
+#   mpirun -N 1 -hostfile /etc/mpi/hostfile \
+#     azcp-cluster https://acct.blob.core.windows.net/ctr/prefix/ /mnt/nvme/dst
+
+ARG OPENMPI_VERSION=4.1.6
+ARG UCX_VERSION=1.15.0
+ARG RUST_VERSION=1.86
+
+############################
+# Stage 1: build OpenMPI + UCX (per target arch)
+############################
+FROM --platform=$TARGETPLATFORM debian:bookworm-slim AS mpi-build
+ARG OPENMPI_VERSION
+ARG UCX_VERSION
+
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        build-essential ca-certificates curl file libnuma-dev pkg-config \
+        libibverbs-dev librdmacm-dev libnl-3-dev libnl-route-3-dev \
+        autoconf automake libtool m4 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /tmp
+RUN curl -fsSL "https://github.com/openucx/ucx/releases/download/v${UCX_VERSION}/ucx-${UCX_VERSION}.tar.gz" -o ucx.tgz \
+ && tar xzf ucx.tgz && cd ucx-${UCX_VERSION} \
+ && ./configure --prefix=/opt/ucx --enable-optimizations --disable-logging --disable-debug \
+        --disable-assertions --disable-params-check --without-java \
+ && make -j"$(nproc)" && make install \
+ && rm -rf /tmp/ucx*
+
+RUN curl -fsSL "https://download.open-mpi.org/release/open-mpi/v${OPENMPI_VERSION%.*}/openmpi-${OPENMPI_VERSION}.tar.bz2" -o ompi.tbz \
+ && tar xjf ompi.tbz && cd openmpi-${OPENMPI_VERSION} \
+ && ./configure --prefix=/opt/openmpi --with-ucx=/opt/ucx --without-verbs \
+        --enable-mca-no-build=btl-uct --disable-static --enable-shared \
+ && make -j"$(nproc)" && make install \
+ && rm -rf /tmp/openmpi*
+
+############################
+# Stage 2: build azcp-cluster against the locally-built OpenMPI
+############################
+FROM --platform=$TARGETPLATFORM rust:${RUST_VERSION}-bookworm AS rust-build
+
+COPY --from=mpi-build /opt/ucx /opt/ucx
+COPY --from=mpi-build /opt/openmpi /opt/openmpi
+
+ENV PATH=/opt/openmpi/bin:$PATH \
+    LD_LIBRARY_PATH=/opt/openmpi/lib:/opt/ucx/lib \
+    PKG_CONFIG_PATH=/opt/openmpi/lib/pkgconfig:/opt/ucx/lib/pkgconfig
+
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        clang libclang-dev pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+COPY crates ./crates
+RUN cargo build --release --locked -p azcp -p azcp-cluster
+
+############################
+# Stage 3: runtime
+############################
+FROM --platform=$TARGETPLATFORM debian:bookworm-slim AS runtime
+
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        ca-certificates libnuma1 libibverbs1 librdmacm1 libnl-3-200 libnl-route-3-200 \
+        openssh-client openssh-server \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=mpi-build /opt/ucx /opt/ucx
+COPY --from=mpi-build /opt/openmpi /opt/openmpi
+COPY --from=rust-build /src/target/release/azcp /usr/local/bin/azcp
+COPY --from=rust-build /src/target/release/azcp-cluster /usr/local/bin/azcp-cluster
+
+ENV PATH=/opt/openmpi/bin:/usr/local/bin:$PATH \
+    LD_LIBRARY_PATH=/opt/openmpi/lib:/opt/ucx/lib \
+    OMPI_ALLOW_RUN_AS_ROOT=1 \
+    OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+
+RUN ldconfig
+
+ENTRYPOINT ["azcp-cluster"]

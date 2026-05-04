@@ -105,12 +105,13 @@ pub fn get_storage_token_imds() -> Result<Option<String>, AzcpError> {
         // Classify so callers can distinguish "this VM has no identity / not Azure"
         // (skip → Ok(None)) from "transient or actionable failure" (Err).
         if body.contains("Multiple user assigned identities") {
-            return Err(AzcpError::Auth(format!(
+            return Err(AzcpError::Auth(
                 "IMDS: multiple user-assigned identities are attached to this VM. \
                  Set AZURE_CLIENT_ID (preferred) or AZURE_MSI_RESOURCE_ID to select one. \
                  List them with: `az vmss identity show -g <node-rg> -n <vmss-name>` or \
                  `az vm identity show -g <rg> -n <vm>`."
-            )));
+                    .to_string(),
+            ));
         }
         // 400 with "Identity not found" / "No managed identity" = Azure VM without
         // an MSI assigned (or wrong client_id). 404 = endpoint shape mismatch

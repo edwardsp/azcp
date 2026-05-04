@@ -1,8 +1,11 @@
 [package]
 name = "azcp"
-version = "0.1.16"
+version = "0.2.0"
 edition = "2021"
 description = "A Rust implementation of Azure Storage data transfer (azcopy)"
+
+[workspace]
+members = ["crates/azcp-cluster"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }

@@ -81,11 +81,7 @@ fn glob_filter_local(args: &SyncArgs, files: Vec<LocalEntry>) -> Result<Vec<Loca
         .collect())
 }
 
-fn glob_filter_blobs(
-    args: &SyncArgs,
-    blobs: Vec<BlobItem>,
-    prefix: &str,
-) -> Result<Vec<BlobItem>> {
+fn glob_filter_blobs(args: &SyncArgs, blobs: Vec<BlobItem>, prefix: &str) -> Result<Vec<BlobItem>> {
     let include = build_glob_set(args.include_pattern.as_deref())?;
     let exclude = build_glob_set(args.exclude_pattern.as_deref())?;
     Ok(blobs
@@ -278,11 +274,7 @@ async fn needs_download(
     }
 }
 
-async fn sync_local_to_blob(
-    source: &str,
-    dest: &BlobLocation,
-    args: &SyncArgs,
-) -> Result<()> {
+async fn sync_local_to_blob(source: &str, dest: &BlobLocation, args: &SyncArgs) -> Result<()> {
     let credential = resolve_credential(dest)?;
     let engine = build_engine(args, credential)?;
 
@@ -350,8 +342,14 @@ async fn sync_local_to_blob(
                 to_delete.push(blob_path);
             }
         }
-        delete_remote_parallel(engine.client(), &dest.account, &dest.container, to_delete, args)
-            .await?;
+        delete_remote_parallel(
+            engine.client(),
+            &dest.account,
+            &dest.container,
+            to_delete,
+            args,
+        )
+        .await?;
     }
 
     println!(
@@ -368,11 +366,7 @@ async fn sync_local_to_blob(
     Ok(())
 }
 
-async fn sync_blob_to_local(
-    source: &BlobLocation,
-    dest: &str,
-    args: &SyncArgs,
-) -> Result<()> {
+async fn sync_blob_to_local(source: &BlobLocation, dest: &str, args: &SyncArgs) -> Result<()> {
     let credential = resolve_credential(source)?;
     let engine = build_engine(args, credential)?;
 
@@ -405,8 +399,7 @@ async fn sync_blob_to_local(
             .map(|b| b.name.as_str())
             .collect();
         if !missing.is_empty() {
-            let sample: Vec<String> =
-                missing.iter().take(10).map(|s| s.to_string()).collect();
+            let sample: Vec<String> = missing.iter().take(10).map(|s| s.to_string()).collect();
             let extra = missing.len().saturating_sub(sample.len());
             let extra_note = if extra > 0 {
                 format!("\n  ... and {extra} more")

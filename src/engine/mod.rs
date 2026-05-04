@@ -154,7 +154,7 @@ impl TransferEngine {
         progress_bar: Option<&indicatif::ProgressBar>,
     ) -> Result<()> {
         let block_size = self.config.block_size as usize;
-        let num_blocks = (file_size as usize + block_size - 1) / block_size;
+        let num_blocks = (file_size as usize).div_ceil(block_size);
         let check_md5 = self.config.check_md5;
 
         let mut block_entries = Vec::with_capacity(num_blocks);
@@ -168,8 +168,7 @@ impl TransferEngine {
         let block_ids: Vec<String> = block_entries.iter().map(|e| e.id.clone()).collect();
 
         // Bounded channel: caps prefetched blocks in RAM to ~concurrency.
-        let (tx, mut rx) =
-            tokio::sync::mpsc::channel::<(String, Bytes)>(self.config.concurrency);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, Bytes)>(self.config.concurrency);
 
         let producer_path = local_path.to_path_buf();
         let producer = tokio::spawn(async move {
@@ -238,6 +237,7 @@ impl TransferEngine {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn download_file(
         &self,
         account: &str,
@@ -286,6 +286,7 @@ impl TransferEngine {
         Ok(written)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn download_chunks(
         &self,
         account: &str,
@@ -300,7 +301,7 @@ impl TransferEngine {
 
         let discard = self.config.discard;
         let block_size = self.config.block_size;
-        let num_chunks = (file_size + block_size - 1) / block_size;
+        let num_chunks = file_size.div_ceil(block_size);
 
         if !discard {
             // Pre-allocate the file so workers can write to non-overlapping
@@ -367,8 +368,14 @@ impl TransferEngine {
     ) -> Result<TransferSummary> {
         let mut files = local::walk_directory(local_dir, self.config.recursive).await?;
         files.retain(|f| self.path_matches(&f.relative_path));
-        apply_shard(&mut files, self.config.shard, |f| f.relative_path.clone(), |f| f.size);
-        self.upload_entries(files, account, container, blob_prefix).await
+        apply_shard(
+            &mut files,
+            self.config.shard,
+            |f| f.relative_path.clone(),
+            |f| f.size,
+        );
+        self.upload_entries(files, account, container, blob_prefix)
+            .await
     }
 
     pub async fn upload_entries(
@@ -468,7 +475,7 @@ impl TransferEngine {
                 continue;
             }
 
-            let num_blocks = ((file_size + block_size - 1) / block_size) as usize;
+            let num_blocks = file_size.div_ceil(block_size) as usize;
             let block_entries: Vec<BlockListEntry> = (0..num_blocks)
                 .map(|i| BlockListEntry {
                     id: STANDARD.encode(format!("{i:06}")),
@@ -624,7 +631,9 @@ impl TransferEngine {
             }
         }
 
-        if owns_progress { progress.finish(); }
+        if owns_progress {
+            progress.finish();
+        }
 
         Ok(TransferSummary {
             total_files,
@@ -661,9 +670,15 @@ impl TransferEngine {
             &mut blobs,
             self.config.shard,
             |b| b.name.clone(),
-            |b| b.properties.as_ref().and_then(|p| p.content_length).unwrap_or(0),
+            |b| {
+                b.properties
+                    .as_ref()
+                    .and_then(|p| p.content_length)
+                    .unwrap_or(0)
+            },
         );
-        self.download_entries(blobs, account, container, blob_prefix, local_dir).await
+        self.download_entries(blobs, account, container, blob_prefix, local_dir)
+            .await
     }
 
     pub async fn download_entries(
@@ -725,10 +740,7 @@ impl TransferEngine {
                 .as_ref()
                 .and_then(|p| p.content_length)
                 .unwrap_or(0);
-            let expected_md5 = blob
-                .properties
-                .as_ref()
-                .and_then(|p| p.content_md5.clone());
+            let expected_md5 = blob.properties.as_ref().and_then(|p| p.content_md5.clone());
 
             if !discard {
                 local::ensure_parent_dir(&local_path).await?;
@@ -807,7 +819,7 @@ impl TransferEngine {
                         ))
                     };
 
-                    let num_chunks = (file_size + block_size - 1) / block_size;
+                    let num_chunks = file_size.div_ceil(block_size);
                     let mut block_handles: Vec<tokio::task::JoinHandle<Result<()>>> =
                         Vec::with_capacity(num_chunks as usize);
 
@@ -894,7 +906,9 @@ impl TransferEngine {
             }
         }
 
-        if owns_progress { progress.finish(); }
+        if owns_progress {
+            progress.finish();
+        }
 
         Ok(TransferSummary {
             total_files,
@@ -911,11 +925,10 @@ impl TransferEngine {
 // Lines that are blank, start with `#`, or have a non-numeric size field
 // (e.g. the `<name>\t-\tDIR` rows emitted for prefixes) are skipped so the
 // same file works for both human inspection and machine consumption.
-fn read_shardlist(path: &Path) -> Result<Vec<crate::storage::blob::models::BlobItem>> {
+pub fn read_shardlist(path: &Path) -> Result<Vec<crate::storage::blob::models::BlobItem>> {
     use crate::storage::blob::models::{BlobItem, BlobProperties};
-    let content = std::fs::read_to_string(path).map_err(|e| {
-        AzcpError::Transfer(format!("read shardlist {}: {e}", path.display()))
-    })?;
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| AzcpError::Transfer(format!("read shardlist {}: {e}", path.display())))?;
     let mut out = Vec::new();
     for (lineno, raw) in content.lines().enumerate() {
         let line = raw.trim_end_matches('\r');
@@ -946,7 +959,11 @@ fn read_shardlist(path: &Path) -> Result<Vec<crate::storage::blob::models::BlobI
         };
         let last_modified = fields.next().and_then(|s| {
             let s = s.trim();
-            if s.is_empty() || s == "-" { None } else { Some(s.to_string()) }
+            if s.is_empty() || s == "-" {
+                None
+            } else {
+                Some(s.to_string())
+            }
         });
         out.push(BlobItem {
             name,
@@ -969,7 +986,7 @@ fn read_shardlist(path: &Path) -> Result<Vec<crate::storage::blob::models::BlobI
 // set; determinism (same partition on every worker) requires identical input
 // order and tie-breaking, hence the (size desc, name asc) sort and stable
 // greedy assignment to the lowest-loaded bin.
-fn apply_shard<T, F, S>(items: &mut Vec<T>, shard: Option<(usize, usize)>, name: F, size: S)
+pub fn apply_shard<T, F, S>(items: &mut Vec<T>, shard: Option<(usize, usize)>, name: F, size: S)
 where
     F: Fn(&T) -> String,
     S: Fn(&T) -> u64,
@@ -1168,10 +1185,10 @@ mod tests {
             ("d".into(), 1),
         ];
         let mut totals = [0u64; 2];
-        for shard in 0..2 {
+        for (shard, total) in totals.iter_mut().enumerate() {
             let mut s = items.clone();
             apply_shard(&mut s, Some((shard, 2)), |t| t.0.clone(), |t| t.1);
-            totals[shard] = s.iter().map(|t| t.1).sum();
+            *total = s.iter().map(|t| t.1).sum();
         }
         assert_eq!(totals.iter().sum::<u64>(), 104);
         assert_eq!(*totals.iter().max().unwrap(), 100);
@@ -1202,12 +1219,18 @@ mod tests {
         std::fs::remove_file(&p).ok();
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].name, "a/x.bin");
-        assert_eq!(out[0].properties.as_ref().unwrap().content_length, Some(100));
+        assert_eq!(
+            out[0].properties.as_ref().unwrap().content_length,
+            Some(100)
+        );
         assert_eq!(
             out[0].properties.as_ref().unwrap().last_modified.as_deref(),
             Some("Wed, 22 Apr 2026 07:33:41 GMT")
         );
-        assert_eq!(out[1].properties.as_ref().unwrap().content_length, Some(200));
+        assert_eq!(
+            out[1].properties.as_ref().unwrap().content_length,
+            Some(200)
+        );
         assert!(out[1].properties.as_ref().unwrap().last_modified.is_none());
     }
 
