@@ -1,6 +1,27 @@
 # azcp
 
-A Rust port of [`azcopy`](https://github.com/Azure/azure-storage-azcopy) focused on Azure Blob Storage. Fast, parallel, and with a small, predictable CLI.
+A fast, parallel CLI and MPI cluster tool for moving data between Azure Blob
+Storage and your compute. Familiar `azcopy`-style syntax, designed for the
+three throughput ceilings you hit on real workloads:
+
+1. **One process** — saturating a single tokio runtime + connection pool
+   tops out around 25-28 Gbps. `azcp copy --workers N` spawns N
+   independent runtimes to scale past it.
+2. **One node** — past ~70 Gbps the host's overlay network, NUMA placement,
+   and per-CPU softirq queues become the bottleneck. `--shard i/N`,
+   `hostNetwork`, and `numactl` peel those layers back to 200 Gbps. See
+   [docs/performance-tuning.md](docs/performance-tuning.md).
+3. **One cluster** — when many nodes need the same dataset, paying Azure
+   egress per node is wasteful. `azcp-cluster` (companion MPI binary)
+   downloads `1/N` of the dataset per rank and `MPI_Bcast`s the rest over
+   RDMA/IB at fabric speed, for a 5-10× end-to-end win on 10+ nodes. See
+   [docs/cluster.md](docs/cluster.md).
+
+The CLI surface is intentionally close to `azcopy` so muscle-memory carries
+over: `azcp copy`, `azcp sync`, `azcp ls`, `azcp rm`, `azcp mk`. The
+internals are different — Rust, single static binary per platform, jemalloc
+by default, deterministic LPT sharding for parallelism that composes
+across processes and nodes.
 
 ## Features
 
@@ -12,7 +33,8 @@ A Rust port of [`azcopy`](https://github.com/Azure/azure-storage-azcopy) focused
 - Parallel block uploads / downloads with a single global concurrency budget
 - `--include-pattern` / `--exclude-pattern` glob filters on all bulk commands
 - Live progress bar tracking bytes, throughput, ETA, and file counts
-- Authentication via Shared Key, SAS, Bearer token, or Azure CLI ambient credentials
+- Authentication via Shared Key, SAS, Bearer token, AKS workload identity, Azure VM managed identity, or Azure CLI ambient credentials
+- **`azcp-cluster`** companion MPI binary for multi-node broadcast downloads (see [docs/cluster.md](docs/cluster.md))
 
 ## Installation
 
@@ -30,6 +52,17 @@ Download the archive for your platform from the [latest release](../../releases/
 | Windows arm64 | `azcp-aarch64-pc-windows-msvc.zip` |
 
 Each archive contains the `azcp` binary plus a SHA256 sidecar for verification.
+
+`azcp-cluster` is shipped **as a container only** — it links Open MPI and
+dlopens UCX/libibverbs at runtime, so a self-contained binary that works
+against arbitrary host MPI/UCX stacks is impractical. Pull from GHCR:
+
+```
+ghcr.io/edwardsp/azcp/azcp-cluster:v0.2.0
+```
+
+Multi-arch (`linux/amd64`, `linux/arm64`). See
+[docs/cluster.md](docs/cluster.md) for AKS and Slurm deployment.
 
 ### From source
 
@@ -93,7 +126,7 @@ Two independent knobs control parallelism:
 - `--workers N` (default 1): spawn N independent tokio runtimes in one process, each with its own `reqwest` connection pool and its own shard of the workload. **Required to scale past ~28 Gbps** — a single tokio runtime + reqwest client tops out there regardless of how many concurrent requests you submit (see "why workers are necessary" below).
 - `--concurrency N` (default 64) and `--parallel-files N` (default 16, env `AZCP_PARALLEL_FILES`): per-runtime limits on in-flight HTTP block requests and actively-transferring files. With `--workers > 1`, these are per-worker.
 
-For 16+ large files at 100+ GbE, `--workers 4 --concurrency 32 --parallel-files 4 --block-size 16777216` reaches **~64 Gbps** sustained on download from inside a default Kubernetes pod; `--workers 8` peaks at **~69 Gbps**. To go past that on faster NICs (100-200+ GbE), see [Performance tuning for high-bandwidth NICs](#performance-tuning-for-high-bandwidth-nics) — the limiting factor at that point is the host network stack and NUMA placement, not `azcp`'s tuning knobs.
+For 16+ large files at 100+ GbE, `--workers 4 --concurrency 32 --parallel-files 4 --block-size 16777216` reaches **~64 Gbps** sustained on download from inside a default Kubernetes pod; `--workers 8` peaks at **~69 Gbps**. To go past that on faster NICs (100-200+ GbE), see [docs/performance-tuning.md](docs/performance-tuning.md) — the limiting factor at that point is the host network stack and NUMA placement, not `azcp`'s tuning knobs.
 
 ```bash
 # High-throughput download (320 GiB / 160 files measured at 64 Gbps sustained)
@@ -156,6 +189,10 @@ multi-node deployments, run one process per node with `--shard $NODE/$NODES`
 and leave `--workers` at 1, or scale `--workers` within each node and
 partition across nodes by some other means (e.g. different prefixes per
 node).
+
+For the **same dataset on every node** (model checkpoints, training data),
+prefer [`azcp-cluster`](docs/cluster.md) over per-node `--shard` — it pays
+Azure egress once and broadcasts at fabric speed.
 
 ##### Sharding gotchas
 
@@ -309,238 +346,30 @@ azcp rm https://acct.blob.core.windows.net/ctr/prefix \
 azcp mk https://acct.blob.core.windows.net/new-container
 ```
 
-## Performance tuning for high-bandwidth NICs
+## High-bandwidth NICs and multi-node broadcast
 
-`azcp`'s default flags saturate a 25-50 GbE link with ease. Past that, the bottleneck stops being the wire and starts being the host's network stack, the kernel's per-CPU softirq queues, and (on container platforms) the overlay network sitting between your process and the NIC. This section documents the layers you have to peel back to drive a **100-200+ Gbps** NIC at line rate, and the recipes for both bare VMs and Kubernetes/AKS.
+Two layers of additional throughput live in [`docs/`](docs/):
 
-You only need this if:
+- **[docs/performance-tuning.md](docs/performance-tuning.md)** — single-node
+  techniques for pushing 100-200+ Gbps NICs to line rate on bare VMs and
+  AKS: `hostNetwork`, NUMA pinning, multi-process sharding, the AKS
+  overlay-network bottleneck, and the storage-account egress ceiling.
 
-- Your NIC is fast enough that one process can't saturate it (typically **100 GbE and up**).
-- Your host has multiple NUMA nodes (most modern dual-socket or large single-socket servers).
-- You are seeing wire utilization well below NIC capacity despite plenty of `--workers` and `--concurrency`.
-
-On 10/25 GbE the techniques here still apply, but the gains are small — `--workers` alone is usually enough.
-
-### Bottleneck progression (measured)
-
-The following was measured downloading a 385 GiB / 175-file checkpoint from a single Azure storage account to a single node with a 200 Gbps NIC. Each row removes one bottleneck:
-
-| Configuration | `azcp` flags (per process) | Procs | App Gbps | Wire Gbps | NIC util |
-|---|---|---:|---:|---:|---:|
-| Kubernetes overlay pod (default) | `--workers 8 --concurrency 32 --block-size 16777216` | 1 | 62.7 | ~70 | 35% |
-| Pod with `hostNetwork: true` | `--workers 8 --concurrency 64 --block-size 16777216` | 1 | 117 | 127 | 64% |
-| `hostNetwork` + NUMA-pinned (single proc) | `numactl --cpunodebind=N --membind=N azcp ... --workers 8 --concurrency 64 --block-size 16777216` | 1 | 131 | 145 | 73% |
-| `hostNetwork` + NUMA-pinned, 2 procs | `numactl ... azcp ... --workers 1 --concurrency 32 --shard i/2 --block-size 16777216` | 2 | 150 | 158 | 79% |
-| `hostNetwork` + NUMA-pinned, **4 procs** | `numactl ... azcp ... --workers 1 --concurrency 32 --shard i/4 --block-size 16777216` | **4** | **170** | **186** | **93%** |
-
-All rows used the same 385 GiB / 175-file dataset (~2.2 GiB avg file size) with `--recursive`. `--parallel-files` was left at its default (`min(concurrency, file_count)`). The single-proc rows benefit from higher per-runtime concurrency (`--concurrency 64`); the multi-proc rows split work via `--shard` and use lower per-process concurrency since aggregate in-flight requests = `procs × concurrency`.
-
-Net: **+103 Gbps (2.7×)** by combining `hostNetwork` (or running on bare metal/VMs), NUMA pinning, and multiple cooperating processes.
-
-### NUMA — what it is and why it matters
-
-Modern multi-socket and many-core servers split CPUs and memory into **NUMA nodes** (Non-Uniform Memory Access). Each NUMA node has its own bank of RAM and its own slice of the PCIe bus. Memory on the *local* node is fast to reach; memory on a *remote* node goes over an inter-socket link and is slower.
-
-Your NIC is physically attached to *one* NUMA node. When packets arrive, the kernel's softirq runs on a CPU near the NIC and writes data into RAM. If your `azcp` process happens to be running on the *other* NUMA node, every received byte gets copied across the inter-socket link before your code can touch it. On a 200 Gbps NIC this costs ~10-15 Gbps and noticeably increases tail latency.
-
-Find your NIC's NUMA node:
-
-```bash
-# Replace eth0 with your interface name (see `ip link`)
-cat /sys/class/net/eth0/device/numa_node
-# 1   ← NIC is on NUMA node 1
-```
-
-Then pin `azcp` to the same node using `numactl` (install via `apt install numactl` / `dnf install numactl`):
-
-```bash
-numactl --cpunodebind=1 --membind=1 azcp copy ...
-```
-
-`--cpunodebind` restricts threads to CPUs on that node; `--membind` restricts allocations to that node's memory. Both matter.
-
-A single NUMA-pinned process won't saturate a fast NIC by itself — see the next section.
-
-### Multi-process for line rate
-
-Even with `hostNetwork` and NUMA pinning, a single `azcp` process tops out around 130 Gbps because tokio's scheduler and `reqwest`'s connection pool serialize work that no amount of internal parallelism can spread. To go further, run **multiple cooperating processes**, each pinned to the NIC's NUMA node, each handling a deterministic shard of the file set:
-
-```bash
-# 4 cooperating processes, all on NUMA node 1, each owning 1/4 of the workload
-for i in 0 1 2 3; do
-  numactl --cpunodebind=1 --membind=1 \
-    azcp copy https://acct.blob.core.windows.net/ctr/prefix/ ./dst/ \
-      --recursive --shard $i/4 --workers 1 --concurrency 32 \
-      --block-size 16777216 &
-done
-wait
-```
-
-`--shard i/N` makes process `i` of `N` deterministically own its slice (size-balanced LPT bin packing — see [Throughput tuning](#throughput-tuning) above). Sharding works the same whether the `N` processes run on one node or across many.
-
-### Bare VM recipe
-
-```bash
-# 1. Find your NIC's NUMA node
-NUMA=$(cat /sys/class/net/eth0/device/numa_node)
-
-# 2. Single high-throughput invocation (good up to ~130 Gbps single-process)
-numactl --cpunodebind=$NUMA --membind=$NUMA \
-  azcp copy https://acct.blob.core.windows.net/ctr/prefix/ ./dst/ \
-    --recursive --workers 8 --concurrency 32 --block-size 16777216
-
-# 3. Or fan out to multiple processes for max throughput
-for i in 0 1 2 3; do
-  numactl --cpunodebind=$NUMA --membind=$NUMA \
-    azcp copy https://acct.blob.core.windows.net/ctr/prefix/ ./dst/ \
-      --recursive --shard $i/4 --workers 1 --concurrency 32 \
-      --block-size 16777216 &
-done
-wait
-```
-
-### Kubernetes / AKS recipe
-
-The default pod network on most Kubernetes clusters (including AKS Azure CNI overlay) puts every packet through a `veth` pair, a bridge, and (on overlay) a VXLAN tunnel. The pod's `veth` typically has a single RX queue with RPS (Receive Packet Steering) disabled, so all inbound network softirq for the pod lands on **one CPU**. That CPU saturates around 50-70 Gbps regardless of how many workers `azcp` is using.
-
-`hostNetwork: true` bypasses the overlay entirely — your process uses the host's NIC directly, with all of its hardware queues and softirq spread across many cores.
-
-```yaml
-apiVersion: v1
-kind: Pod
-metadata:
-  name: azcp-fast
-spec:
-  hostNetwork: true
-  dnsPolicy: ClusterFirstWithHostNet
-  containers:
-  - name: azcp
-    image: your/image-with-azcp-and-numactl
-    command: ["bash", "-lc"]
-    args:
-    - |
-      set -euo pipefail
-      apt-get update && apt-get install -y numactl
-      NUMA=$(cat /sys/class/net/eth0/device/numa_node)
-      for i in 0 1 2 3; do
-        numactl --cpunodebind=$NUMA --membind=$NUMA \
-          azcp copy https://acct.blob.core.windows.net/ctr/prefix/ /dst/ \
-            --recursive --shard $i/4 --workers 1 --concurrency 32 \
-            --block-size 16777216 &
-      done
-      wait
-```
-
-`hostNetwork: true` is the single biggest win on AKS — typically **+50 Gbps** over the overlay, before any other tuning. It does mean the pod shares the host's network namespace, so coordinate port usage with anything else running on the node.
-
-### Account-level ceiling
-
-Once a single node is doing 170-200 Gbps, the next ceiling you'll hit is the **storage account egress cap** itself (~230 Gbps observed for a standard general-purpose v2 account, with hard 503 `ServerBusy` storms above that). Scale across multiple accounts or request a quota increase if you need more.
-
-## Cluster broadcast (`azcp-cluster`)
-
-When **many nodes need the same dataset** (e.g. distributed training pulling
-the same model checkpoint), having every node hit Azure independently wastes
-egress and is bottlenecked by per-node Azure throughput. `azcp-cluster` is a
-companion MPI binary that:
-
-1. Shards the dataset across `N` ranks so each rank pulls only `1/N` of the
-   bytes from Azure (size-balanced LPT, same algorithm as `azcp --shard`).
-2. After download, every file is `MPI_Bcast`'d from its owner rank to all
-   other ranks over the cluster fabric (RDMA / InfiniBand if UCX finds it,
-   TCP otherwise).
-
-Net: Azure egress is paid **once per byte** instead of `N` times, and the
-intra-cluster fan-out runs at fabric speed (typically much higher than the
-per-node Azure link). For 10+ nodes on fast NICs with an equally fast or
-faster fabric, end-to-end time drops by **5-10×** vs the naive
-"every-node-downloads-from-Azure" approach.
-
-### Requirements
-
-- One process per node (the binary aborts if it sees more than one rank
-  sharing the same node).
-- An MPI launcher (`mpirun` from Open MPI 4.x is what the shipped image
-  carries). UCX is bundled for RDMA transport.
-- Local fast storage on every node (NVMe recommended) mounted at the same
-  path on all nodes.
-
-### Image
-
-Multi-arch (`linux/amd64`, `linux/arm64`) image is published to GHCR by the
-`cluster-image` workflow:
-
-```
-ghcr.io/<owner>/azcp/azcp-cluster:<tag>
-```
-
-Tags: `latest` and `vX.Y.Z` on releases, `edge` on `main`, branch-sha for PRs.
-
-### CLI
-
-```
-azcp-cluster <SOURCE> <DEST> [flags]
-```
-
-| Flag | Default | Purpose |
-|---|---|---|
-| `--shardlist FILE` | (off) | Skip the LIST API; read pre-generated TSV manifest (same format as `azcp ls --machine-readable`). Saves the LIST round-trip on rank 0 for very large datasets. |
-| `--compare {none,size,filelist}` | `none` | Skip-policy. `none` re-transfers every file. `size` skips files where the local size matches the blob size. `filelist` (requires `--filelist FILE`) skips when local size **and** the blob's `Last-Modified` both match the prior-run filelist. |
-| `--filelist FILE` | — | Required when `--compare filelist`. Prior-run TSV with sizes + `Last-Modified`. |
-| `--save-filelist FILE` | — | After the run, rank 0 writes the post-run TSV to `FILE` for use as the next run's `--filelist`. |
-| `--concurrency N` | 64 | In-flight HTTP block requests per rank (forwarded to the azcp engine). |
-| `--block-size N` | 16 MiB | Block size for downloads. |
-| `--parallel-files N` | 16 | Files actively downloading concurrently per rank. |
-| `--bcast-chunk N` | 64 MiB | Chunk size for `MPI_Bcast`. |
-| `--max-retries N` | 5 | Per-HTTP-request retry budget. |
-| `--no-progress` | — | Disable per-rank progress bars (default: TTY-aware). |
-
-### Stage timing output
-
-On rank 0, `azcp-cluster` always prints exactly six summary lines:
-
-```
-[list]     <files> files, <bytes> bytes T=<sec>s
-[diff]     <to-transfer> to transfer, <skipped> skipped T=<sec>s
-[download] <bytes> bytes T=<sec>s BW=<aggregate>
-[bcast]    <files> files <bytes> bytes T=<sec>s BW=<per-receiver>
-[filelist] (wrote <n> entries | skipped (no --save-filelist)) T=<sec>s
-[total]    T=<sec>s
-```
-
-`[shard]` lines on stderr show per-rank slice sizes (one per rank, useful for
-debugging LPT balance).
-
-### Example: 4-node download of a model checkpoint
-
-```bash
-mpirun -N 1 -hostfile /etc/mpi/hostfile \
-  azcp-cluster \
-    https://acct.blob.core.windows.net/models/llama-405b/ \
-    /mnt/nvme/llama-405b/ \
-    --concurrency 32 --block-size 16777216 --bcast-chunk 67108864 \
-    --compare size \
-    --save-filelist /mnt/nvme/llama-405b.filelist
-```
-
-Subsequent runs against the same dataset can use `--compare filelist
---filelist /mnt/nvme/llama-405b.filelist` to skip unchanged files at full
-LIST speed, paying neither the Azure download nor the intra-cluster bcast
-for files that haven't changed.
-
-### Failure semantics
-
-- LIST or any per-rank stage error → `MPI_Abort` with a non-zero exit code
-  (3 = list, 4 = diff, 5 = download, 6 = bcast). The whole job exits.
-- Multiple ranks per node detected → exit code 2 with an explanatory message.
-- Per-file download failures inside a rank's shard surface as a non-zero exit
-  via the existing engine's `Failed: N` summary; the broadcast stage will
-  never run if any rank reports a failed download.
-
-### See also
-
-- [`tests/AKS_TESTING.md`](tests/AKS_TESTING.md) for the AKS smoke-test
-  procedure.
+- **[docs/cluster.md](docs/cluster.md)** — `azcp-cluster`, the companion
+  MPI binary that downloads `1/N` of a dataset per rank and broadcasts it
+  over RDMA/InfiniBand to every other rank. For the "many nodes, same
+  dataset" pattern (model checkpoints across a training cluster), it pays
+  Azure egress once and ends up 5-10× faster end-to-end than per-node
+  downloads.
+  - [docs/cluster-aks.md](docs/cluster-aks.md) — AKS deployment via
+    mpi-operator (recommended) or StatefulSet (fallback).
+    Examples: [examples/aks/](examples/aks/).
+  - [docs/cluster-slurm.md](docs/cluster-slurm.md) — Slurm deployment via
+    enroot + pyxis (recommended) or Apptainer (alternative).
+    Examples: [examples/slurm/](examples/slurm/).
+  - [docs/cluster-benchmarks.md](docs/cluster-benchmarks.md) — measured
+    bcast and download bandwidth on a 16-node InfiniBand reference
+    cluster.
 
 ## Configuration
 
@@ -578,33 +407,37 @@ Tests skip cleanly when those env vars are unset. Each test uses a unique `azcp-
 
 Coverage includes: upload+rerun skip behavior, all four `--compare-method` strategies, `--delete-destination`, blob→local sync, and `--include-pattern` / `--exclude-pattern` filtering.
 
+### `azcp-cluster` smoke tests
+
+- [`tests/cluster_smoke.sh`](tests/cluster_smoke.sh) — single-node CLI smoke test (no MPI).
+- [`tests/AKS_TESTING.md`](tests/AKS_TESTING.md) — end-to-end AKS smoke procedure.
+
 ## Continuous Integration
 
-`.github/workflows/build.yml` builds all six platform targets on every push/PR using native runners (no cross-compilation). Tag a release to publish binaries:
+`.github/workflows/build.yml` builds all six platform targets on every push/PR using native runners (no cross-compilation). `.github/workflows/cluster-image.yml` builds and publishes the multi-arch `azcp-cluster` container to GHCR. Tag a release to publish both:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
-The release job assembles all artifacts (tarballs/zips + SHA256 checksums) into a GitHub Release with auto-generated notes.
+Binaries land in the GitHub Release; the container lands at
+`ghcr.io/edwardsp/azcp/azcp-cluster:v0.2.0` and `:latest`.
 
 ## Project layout
 
 ```
-src/
-  auth/         SharedKey, SAS, Bearer, Azure CLI credential sources
-  cli/          Command definitions and argument parsing
-  engine/       Transfer engine: parallel scheduler, progress, glob filtering
-  storage/
-    blob/       Blob REST client (list, put block, get range, delete, ...)
-    local.rs    Local filesystem walk
-  error.rs      Error type
-  config.rs     Env-var configuration
-tests/
-  sync_integration.rs   End-to-end sync tests against a live account
-.github/
-  workflows/build.yml   Multi-platform build + release
+src/                          azcp CLI (single-binary)
+  auth/                       SharedKey, SAS, Bearer, Azure CLI credentials
+  cli/                        Command definitions and argument parsing
+  engine/                     Transfer engine: parallel scheduler, progress, glob filtering
+  storage/blob/               Blob REST client (list, put block, get range, delete, ...)
+  storage/local.rs            Local filesystem walk
+crates/azcp-cluster/          Companion MPI binary for multi-node broadcast
+docs/                         Long-form documentation
+examples/                     Copy-paste deployment manifests (AKS, Slurm)
+tests/                        Integration tests + smoke procedures
+.github/workflows/            CI: per-platform binary build + cluster container build
 ```
 
 ## License

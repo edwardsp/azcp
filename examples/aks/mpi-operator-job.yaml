@@ -1,0 +1,144 @@
+---
+# azcp-cluster on AKS via mpi-operator (PRIMARY example).
+#
+# Edit the following before applying:
+#   - Image tag (use a pinned version, not :latest, in production).
+#   - SOURCE_URL: the blob prefix to broadcast.
+#   - AZURE_CLIENT_ID: the kubelet's user-assigned managed identity, with
+#     "Storage Blob Data Reader" on the source storage account.
+#   - nodeSelector: the agent pool with NVMe + IB resources.
+#   - replicas: number of nodes to broadcast across.
+#   - rdma/ib: <N>: the IB device count exposed by your node pool's
+#     network device plugin (typically 4 on InfiniBand-capable Azure SKUs;
+#     check `kubectl describe node <node>` for the actual resource name).
+#
+# Submit:
+#   kubectl apply -f mpi-operator-job.yaml
+#   kubectl logs -f -l training.kubeflow.org/job-role=launcher
+#
+# See docs/cluster-aks.md for prerequisites, mpi-operator install, and
+# troubleshooting.
+
+apiVersion: kubeflow.org/v2beta1
+kind: MPIJob
+metadata:
+  name: azcp-cluster
+spec:
+  slotsPerWorker: 1   # azcp-cluster requires exactly one rank per node
+  launcherCreationPolicy: WaitForWorkersReady
+  runPolicy:
+    cleanPodPolicy: Running
+  mpiReplicaSpecs:
+
+    Launcher:
+      replicas: 1
+      template:
+        metadata:
+          labels:
+            app: azcp-cluster
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: launcher
+              image: ghcr.io/edwardsp/azcp/azcp-cluster:v0.2.0
+              imagePullPolicy: IfNotPresent
+              env:
+                - name: SOURCE_URL
+                  value: "https://REPLACE_WITH_ACCOUNT.blob.core.windows.net/REPLACE_WITH_CONTAINER/REPLACE_WITH_PREFIX/"
+                - name: AZURE_CLIENT_ID
+                  value: "REPLACE_WITH_KUBELET_CLIENT_ID"
+                # Replicate this on every worker via mpirun -x below.
+              command: ["/bin/bash", "-c"]
+              args:
+                - |
+                  set -xeuo pipefail
+                  NUM_NODES=16    # MUST match Worker.replicas below.
+                  mpirun \
+                    --allow-run-as-root \
+                    -np "$NUM_NODES" \
+                    --map-by ppr:1:node \
+                    --bind-to none \
+                    -hostfile /etc/mpi/hostfile \
+                    --prefix /opt/openmpi \
+                    -mca plm_rsh_agent ssh \
+                    -mca pml ucx \
+                    -mca osc ucx \
+                    -mca routed direct \
+                    -mca coll_hcoll_enable 0 \
+                    -x PATH \
+                    -x LD_LIBRARY_PATH \
+                    -x AZURE_CLIENT_ID \
+                    -x SOURCE_URL \
+                    -x UCX_TLS=rc,sm,self \
+                    -x UCX_NET_DEVICES=mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1 \
+                    -x UCX_IB_GID_INDEX=3 \
+                    azcp-cluster \
+                      "$SOURCE_URL" /mnt/nvme/dataset \
+                      --concurrency 32 --block-size 16777216 \
+                      --bcast-chunk 268435456 --bcast-pipeline 8 \
+                      --compare size \
+                      --no-progress
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+          enableServiceLinks: false
+          automountServiceAccountToken: false
+
+    Worker:
+      replicas: 16   # MUST match $NUM_NODES in the launcher script above.
+      template:
+        metadata:
+          labels:
+            app: azcp-cluster
+        spec:
+          # Pick the node pool with NVMe at /mnt/nvme and IB resources.
+          nodeSelector:
+            agentpool: REPLACE_WITH_NODEPOOL
+          tolerations:
+            - operator: Exists
+          # One rank per node — required by azcp-cluster.
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchLabels:
+                      app: azcp-cluster
+                  topologyKey: kubernetes.io/hostname
+          containers:
+            - name: worker
+              image: ghcr.io/edwardsp/azcp/azcp-cluster:v0.2.0
+              imagePullPolicy: IfNotPresent
+              env:
+                - name: AZURE_CLIENT_ID
+                  value: "REPLACE_WITH_KUBELET_CLIENT_ID"
+              securityContext:
+                # Required for UCX / libibverbs to register memory with the IB device.
+                # Without IPC_LOCK, RDMA fails silently and UCX falls back to TCP.
+                capabilities:
+                  add: ["IPC_LOCK"]
+              resources:
+                requests:
+                  cpu: "8"
+                  memory: "16Gi"
+                  rdma/ib: 4
+                limits:
+                  memory: "64Gi"
+                  rdma/ib: 4
+              volumeMounts:
+                - name: nvme
+                  mountPath: /mnt/nvme
+                - name: shm
+                  mountPath: /dev/shm
+          volumes:
+            - name: nvme
+              hostPath:
+                path: /mnt/nvme
+                type: DirectoryOrCreate
+            # Memory-backed /dev/shm so UCX has somewhere to put intra-node
+            # transport buffers. mpi-operator does NOT add this for you.
+            - name: shm
+              emptyDir:
+                medium: Memory
+          enableServiceLinks: false
+          automountServiceAccountToken: false

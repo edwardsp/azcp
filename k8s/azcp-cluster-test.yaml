@@ -78,7 +78,7 @@ data:
     IP1=$(getent hosts azcp-cluster-test-1.azcp-cluster-test | awk 'NR==1{print $1}')
     echo "RANK_IPS: 0=$IP0 1=$IP1"
 
-    mkdir -p /mnt/nvme/deepseek
+    mkdir -p /mnt/nvme/dataset
     # --prefix + -x PATH/LD_LIBRARY_PATH are required so orted on the remote
     # rank can find Open MPI (sshd's non-login shell does not source profile).
     exec mpirun --host "${IP0}:1,${IP1}:1" -np 2 \
@@ -90,7 +90,7 @@ data:
       -x PATH -x LD_LIBRARY_PATH \
       -x AZURE_CLIENT_ID \
       azcp-cluster \
-        "${SOURCE_URL}" /mnt/nvme/deepseek \
+        "${SOURCE_URL}" /mnt/nvme/dataset \
         --concurrency 32 --block-size 16777216 --bcast-chunk 67108864 \
         --compare size \
         --no-progress

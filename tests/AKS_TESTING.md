@@ -116,15 +116,15 @@ Expected: a `[shard]` line per rank, then six summary lines on rank 0:
 Verify both pods got the full dataset:
 
 ```bash
-kubectl exec azcp-cluster-test-0 -- du -sh /mnt/nvme/deepseek
-kubectl exec azcp-cluster-test-1 -- du -sh /mnt/nvme/deepseek
+kubectl exec azcp-cluster-test-0 -- du -sh /mnt/nvme/dataset
+kubectl exec azcp-cluster-test-1 -- du -sh /mnt/nvme/dataset
 ```
 
 Spot-check md5 on a sample file across pods:
 
 ```bash
 SAMPLE=$(kubectl exec azcp-cluster-test-0 -- bash -c \
-  'find /mnt/nvme/deepseek -type f | head -1')
+  'find /mnt/nvme/dataset -type f | head -1')
 kubectl exec azcp-cluster-test-0 -- md5sum "$SAMPLE"
 kubectl exec azcp-cluster-test-1 -- md5sum "$SAMPLE"
 ```
@@ -141,7 +141,7 @@ kubectl delete secret azcp-cluster-test-sshkey
 # Use `kubectl debug` to reach the host filesystem.
 for node in $(kubectl get nodes -l agentpool=<pool> -o name); do
   kubectl debug "$node" --image=busybox --profile=sysadmin -it -- \
-    chroot /host rm -rf /mnt/nvme/deepseek
+    chroot /host rm -rf /mnt/nvme/dataset
 done
 
 # Re-secure the account if you opened it in step 1.

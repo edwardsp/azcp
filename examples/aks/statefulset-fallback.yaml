@@ -1,0 +1,208 @@
+---
+# azcp-cluster on AKS via plain StatefulSet (FALLBACK pattern).
+#
+# Use this when mpi-operator is not available. Otherwise prefer
+# mpi-operator-job.yaml.
+#
+# This pattern collapses launcher and worker into a single pod spec:
+# rank 0 (detected via POD_NAME) runs mpirun against all the other pods'
+# in-pod sshd. See docs/cluster-aks.md for the tradeoffs.
+#
+# Edit before applying:
+#   - Image tag.
+#   - SOURCE_URL.
+#   - AZURE_CLIENT_ID.
+#   - nodeSelector.
+#   - replicas + NREPLICAS env (must match).
+#
+# You also need an SSH keypair Secret named `azcp-cluster-sshkey` in the
+# same namespace. Create it with:
+#   TMP=$(mktemp -d)
+#   ssh-keygen -t ed25519 -N '' -f "$TMP/id_ed25519" -C 'azcp-cluster'
+#   kubectl create secret generic azcp-cluster-sshkey \
+#     --from-file=id_ed25519="$TMP/id_ed25519" \
+#     --from-file=id_ed25519.pub="$TMP/id_ed25519.pub"
+#   rm -rf "$TMP"
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: azcp-cluster
+spec:
+  clusterIP: None
+  selector:
+    app: azcp-cluster
+  ports:
+    - name: ssh
+      port: 22
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: azcp-cluster-cfg
+data:
+  entrypoint.sh: |
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    NREPLICAS="${NREPLICAS:-2}"
+    SVC="azcp-cluster"
+
+    # Wipe NVMe so we exercise the cold-cache path. Remove this if you want
+    # --compare size to actually skip on rerun.
+    rm -rf /mnt/nvme/dataset
+    mkdir -p /mnt/nvme/dataset
+
+    install -m 0700 -d /root/.ssh
+    install -m 0600 /etc/sshkey/id_ed25519     /root/.ssh/id_ed25519
+    install -m 0644 /etc/sshkey/id_ed25519.pub /root/.ssh/id_ed25519.pub
+    install -m 0600 /etc/sshkey/id_ed25519.pub /root/.ssh/authorized_keys
+    # hostNetwork pods share the host's port 22 with the node's real sshd,
+    # so the in-pod sshd binds 2222 instead.
+    cat > /root/.ssh/config <<EOF
+    Host *
+      StrictHostKeyChecking no
+      UserKnownHostsFile /dev/null
+      LogLevel ERROR
+      Port 2222
+    EOF
+
+    ssh-keygen -A
+    install -d -m 0755 /run/sshd
+    sed -i 's/^#\?Port .*/Port 2222/' /etc/ssh/sshd_config
+    /usr/sbin/sshd -D -e &
+    SSHD_PID=$!
+
+    # hostNetwork makes `hostname` return the node name; use the
+    # downward-API POD_NAME env to detect rank 0 reliably.
+    if [[ "${POD_NAME:-$(hostname)}" != "${SVC}-0" ]]; then
+      wait "$SSHD_PID"
+      exit 0
+    fi
+
+    # Wait for every replica's sshd.
+    for i in $(seq 0 $((NREPLICAS-1))); do
+      host="${SVC}-${i}.${SVC}"
+      until ssh -o ConnectTimeout=2 "$host" true 2>/dev/null; do
+        echo "waiting for $host sshd..."
+        sleep 2
+      done
+    done
+
+    # ORTE's FQDN handling is brittle on hostNetwork pods — resolve to IPs
+    # ourselves and pass --host with explicit slots, plus -mca routed direct.
+    HOSTS=""
+    for i in $(seq 0 $((NREPLICAS-1))); do
+      ip=$(getent hosts "${SVC}-${i}.${SVC}" | awk 'NR==1{print $1}')
+      echo "RANK_IP: ${i}=${ip}"
+      if [[ -z "$HOSTS" ]]; then HOSTS="${ip}:1"; else HOSTS="${HOSTS},${ip}:1"; fi
+    done
+
+    mpirun --host "$HOSTS" -np "$NREPLICAS" \
+      --allow-run-as-root \
+      --prefix /opt/openmpi \
+      -mca plm_rsh_agent ssh \
+      -mca pml ucx \
+      -mca osc ucx \
+      -mca oob_tcp_if_include eth0 \
+      -mca routed direct \
+      -x UCX_TLS=rc,sm,self \
+      -x UCX_NET_DEVICES=mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1 \
+      -x UCX_IB_GID_INDEX=3 \
+      -x PATH -x LD_LIBRARY_PATH \
+      -x AZURE_CLIENT_ID \
+      azcp-cluster \
+        "${SOURCE_URL}" /mnt/nvme/dataset \
+        --concurrency 32 --block-size 16777216 \
+        --bcast-chunk 268435456 --bcast-pipeline 8 \
+        --compare size \
+        --no-progress
+    echo "=== mpirun finished, sleeping forever to keep pod for inspection ==="
+    sleep infinity
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: azcp-cluster
+spec:
+  serviceName: azcp-cluster
+  replicas: 2   # MUST match NREPLICAS env below.
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: azcp-cluster
+  template:
+    metadata:
+      labels:
+        app: azcp-cluster
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      restartPolicy: Always
+      nodeSelector:
+        agentpool: REPLACE_WITH_NODEPOOL
+      tolerations:
+        - operator: Exists
+      affinity:
+        # One rank per node — required by azcp-cluster.
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: azcp-cluster
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: azcp-cluster
+          image: ghcr.io/edwardsp/azcp/azcp-cluster:v0.2.0
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/bash", "/etc/mpi/entrypoint.sh"]
+          securityContext:
+            capabilities:
+              add: ["IPC_LOCK"]
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NREPLICAS
+              value: "2"
+            - name: SOURCE_URL
+              value: "https://REPLACE_WITH_ACCOUNT.blob.core.windows.net/REPLACE_WITH_CONTAINER/REPLACE_WITH_PREFIX/"
+            - name: AZURE_CLIENT_ID
+              value: "REPLACE_WITH_KUBELET_CLIENT_ID"
+          volumeMounts:
+            - name: nvme
+              mountPath: /mnt/nvme
+            - name: cfg
+              mountPath: /etc/mpi
+            - name: sshkey
+              mountPath: /etc/sshkey
+              readOnly: true
+            - name: shm
+              mountPath: /dev/shm
+          resources:
+            requests:
+              cpu: "8"
+              memory: "16Gi"
+              rdma/ib: 4
+            limits:
+              memory: "64Gi"
+              rdma/ib: 4
+      volumes:
+        - name: nvme
+          hostPath:
+            path: /mnt/nvme
+            type: DirectoryOrCreate
+        - name: cfg
+          configMap:
+            name: azcp-cluster-cfg
+            defaultMode: 0o755
+        - name: sshkey
+          secret:
+            secretName: azcp-cluster-sshkey
+            defaultMode: 0o600
+        - name: shm
+          emptyDir:
+            medium: Memory
