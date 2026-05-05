@@ -64,6 +64,16 @@ pub struct Args {
     #[arg(long, default_value_t = 64 * 1024 * 1024)]
     pub bcast_chunk: usize,
 
+    /// Number of in-flight Ibcast chunks (depth of the pipeline). Higher
+    /// values overlap disk I/O with the network at the cost of memory
+    /// (`bcast_pipeline * bcast_chunk` bytes per rank). 1 disables
+    /// pipelining and is currently the best default on TCP-only fabrics
+    /// where OpenMPI's MPI_Bcast already pipelines internally; raise it
+    /// when you have RDMA or multi-rail links where additional
+    /// concurrency actually finds more bandwidth.
+    #[arg(long, default_value_t = 1)]
+    pub bcast_pipeline: usize,
+
     /// Maximum retries per HTTP request
     #[arg(long, default_value_t = 5)]
     pub max_retries: u32,

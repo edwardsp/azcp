@@ -51,6 +51,10 @@ fn main() -> ExitCode {
 
     eprintln!("hello rank {rank}/{size} from {}", hostname());
 
+    if rank == 0 {
+        print_transport_diagnostics();
+    }
+
     if matches!(args.stage, Stage::Init) {
         return ExitCode::SUCCESS;
     }
@@ -239,4 +243,47 @@ fn hostname() -> String {
     std::fs::read_to_string("/proc/sys/kernel/hostname")
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|_| "unknown".to_string())
+}
+
+fn print_transport_diagnostics() {
+    eprintln!("[transport] env:");
+    for var in [
+        "OMPI_MCA_pml",
+        "OMPI_MCA_btl",
+        "OMPI_MCA_osc",
+        "UCX_TLS",
+        "UCX_NET_DEVICES",
+        "UCX_IB_GID_INDEX",
+    ] {
+        let val = std::env::var(var).unwrap_or_else(|_| "(unset)".to_string());
+        eprintln!("[transport]   {var}={val}");
+    }
+
+    if let Ok(output) = std::process::Command::new("ompi_info")
+        .args(["--param", "pml", "all", "--level", "9"])
+        .output()
+    {
+        let s = String::from_utf8_lossy(&output.stdout);
+        let active: Vec<&str> = s
+            .lines()
+            .filter(|l| l.contains("MCA pml:") && l.contains("---"))
+            .collect();
+        if !active.is_empty() {
+            eprintln!("[transport] ompi_info pml components: {}", active.len());
+        }
+    }
+
+    if let Ok(output) = std::process::Command::new("ucx_info").arg("-d").output() {
+        let s = String::from_utf8_lossy(&output.stdout);
+        let devices: Vec<&str> = s
+            .lines()
+            .filter(|l| l.starts_with("# Memory domain:") || l.contains("Transport:"))
+            .collect();
+        eprintln!("[transport] ucx_info -d ({} entries):", devices.len());
+        for d in devices.iter().take(40) {
+            eprintln!("[transport]   {}", d.trim());
+        }
+    } else {
+        eprintln!("[transport] ucx_info not available");
+    }
 }
