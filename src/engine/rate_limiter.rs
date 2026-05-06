@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::Semaphore;
 
@@ -10,7 +10,6 @@ use tokio::sync::Semaphore;
 // which is well past anything real network paths produce.
 pub const RATE_UNIT_BYTES: u64 = 1024;
 const REFILL_INTERVAL_MS: u64 = 10;
-const REFILLS_PER_SEC: u64 = 1000 / REFILL_INTERVAL_MS;
 
 pub struct RateLimiter {
     sem: Arc<Semaphore>,
@@ -25,18 +24,34 @@ impl RateLimiter {
             ((bytes_per_sec / RATE_UNIT_BYTES).max(1)).min((u32::MAX / 2) as u64) as usize;
         let sem = Arc::new(Semaphore::new(0));
         let stop = Arc::new(AtomicBool::new(false));
-        let refill_per_tick = ((max_permits as u64) / REFILLS_PER_SEC).max(1) as usize;
 
         let sem_c = sem.clone();
         let stop_c = stop.clone();
         thread::Builder::new()
             .name("azcp-rate-refill".into())
             .spawn(move || {
+                // Refill is paced by real elapsed time, not a fixed
+                // per-tick increment. If the scheduler delays the
+                // wake-up (CI runners under load can stretch a 10 ms
+                // sleep to 100 ms+), we still credit the bucket with
+                // the bandwidth that should have accrued during the
+                // delay. The bucket cap (`max_permits`, one second's
+                // worth) caps burstiness.
+                let permits_per_sec = max_permits as f64;
+                let mut last = Instant::now();
+                let mut leftover: f64 = 0.0;
                 while !stop_c.load(Ordering::Relaxed) {
                     thread::sleep(Duration::from_millis(REFILL_INTERVAL_MS));
+                    let now = Instant::now();
+                    let elapsed = now.duration_since(last).as_secs_f64();
+                    last = now;
+                    let mint = elapsed * permits_per_sec + leftover;
+                    let mint_whole = mint.floor();
+                    leftover = mint - mint_whole;
                     let cur = sem_c.available_permits();
                     if cur < max_permits {
-                        let to_add = std::cmp::min(refill_per_tick, max_permits - cur);
+                        let to_add =
+                            std::cmp::min(mint_whole as usize, max_permits - cur);
                         if to_add > 0 {
                             sem_c.add_permits(to_add);
                         }
