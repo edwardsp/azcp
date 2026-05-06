@@ -32,11 +32,15 @@ Each row removes one bottleneck:
 
 | Configuration | `azcp` flags (per process) | Procs | App Gbps | Wire Gbps | NIC util |
 |---|---|---:|---:|---:|---:|
-| Kubernetes overlay pod (default) | `--workers 8 --concurrency 32 --block-size 16777216` | 1 | 62.7 | ~70 | 35% |
-| Pod with `hostNetwork: true` | `--workers 8 --concurrency 64 --block-size 16777216` | 1 | 117 | 127 | 64% |
-| `hostNetwork` + NUMA-pinned (single proc) | `numactl --cpunodebind=N --membind=N azcp ... --workers 8 --concurrency 64 --block-size 16777216` | 1 | 131 | 145 | 73% |
-| `hostNetwork` + NUMA-pinned, 2 procs | `numactl ... azcp ... --workers 1 --concurrency 32 --shard i/2 --block-size 16777216` | 2 | 150 | 158 | 79% |
-| `hostNetwork` + NUMA-pinned, **4 procs** | `numactl ... azcp ... --workers 1 --concurrency 32 --shard i/4 --block-size 16777216` | **4** | **170** | **186** | **93%** |
+| Kubernetes overlay pod (default) | `--workers 8 --concurrency 32 --block-size 16777216 --discard` | 1 | 62.7 | ~70 | 35% |
+| Pod with `hostNetwork: true` | `--workers 8 --concurrency 64 --block-size 16777216 --discard` | 1 | 117 | 127 | 64% |
+| `hostNetwork` + NUMA-pinned (single proc) | `numactl --cpunodebind=N --membind=N azcp ... --workers 8 --concurrency 64 --block-size 16777216 --discard` | 1 | 131 | 145 | 73% |
+| `hostNetwork` + NUMA-pinned, 2 procs | `numactl ... azcp ... --workers 1 --concurrency 32 --shard i/2 --block-size 16777216 --discard` | 2 | 150 | 158 | 79% |
+| `hostNetwork` + NUMA-pinned, **4 procs** | `numactl ... azcp ... --workers 1 --concurrency 32 --shard i/4 --block-size 16777216 --discard` | **4** | **170** | **186** | **93%** |
+
+> **Network-only measurements.** All rows above use `--discard` to drop
+> downloaded bytes after receipt, isolating network throughput from
+> filesystem-write overhead.
 
 All rows used the same 385 GiB / 175-file dataset (~2.2 GiB avg file
 size) with `--recursive`. `--parallel-files` was left at its default
