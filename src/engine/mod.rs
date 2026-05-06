@@ -846,7 +846,7 @@ impl TransferEngine {
                         // syscalls that were the dominant CPU cost.
                         let mut opts = std::fs::OpenOptions::new();
                         opts.write(true);
-                        #[cfg(unix)]
+                        #[cfg(target_os = "linux")]
                         if direct {
                             use std::os::unix::fs::OpenOptionsExt;
                             opts.custom_flags(libc::O_DIRECT);
@@ -1190,7 +1190,7 @@ fn pwrite_all(file: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<
 // neither aligned nor padded, so we copy each chunk into an aligned scratch
 // buffer rounded up to the next 4 KiB boundary. The trailing junk past the
 // chunk's true length is corrected by an ftruncate after all writes complete.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn pwrite_all_direct(
     file: &std::fs::File,
     buf: &[u8],
@@ -1219,6 +1219,15 @@ fn pwrite_all_direct(
     result
 }
 
+#[cfg(not(target_os = "linux"))]
+fn pwrite_all_direct(
+    file: &std::fs::File,
+    buf: &[u8],
+    offset: u64,
+) -> std::io::Result<()> {
+    pwrite_all(file, buf, offset)
+}
+
 #[cfg(windows)]
 fn pwrite_all(file: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<()> {
     use std::os::windows::fs::FileExt;
@@ -1234,15 +1243,6 @@ fn pwrite_all(file: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<
         written += n;
     }
     Ok(())
-}
-
-#[cfg(windows)]
-fn pwrite_all_direct(
-    file: &std::fs::File,
-    buf: &[u8],
-    offset: u64,
-) -> std::io::Result<()> {
-    pwrite_all(file, buf, offset)
 }
 
 #[cfg(test)]
