@@ -7,31 +7,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [v0.3.0] — 2026-05
 
-Second `azcp-cluster` performance lift, plus an opt-in cryptographic
-integrity check for the broadcast path.
+Second `azcp-cluster` performance lift (multi-writer + O_DIRECT bcast,
+3.5× faster end-to-end on NVMe), an opt-in cryptographic integrity check
+for the broadcast path, and a matching `--direct` write-path on the
+single-node `azcp copy` CLI. Plus a rate-limiter, K-of-N download
+sharding, an az-cli auth fix, and the jemalloc/mimalloc dependencies are
+gone (system allocator only).
 
 ### Added
 
-- **`--bcast-writers N`** (default `2`) on `azcp-cluster`. Fans completed
-  bcast chunks across N writer threads (dispatched by `file_id % N`) on
-  receiver ranks. Owner ranks are unaffected. Lifts the
-  single-thread-buffered-write bottleneck that capped the v0.2.1
-  receive path.
-- **`--bcast-direct`** (default **on**; opt out with `--no-bcast-direct`)
-  on `azcp-cluster`. Opens output files with `O_DIRECT` and uses
-  4 KiB-aligned buffers; the trailing partial chunk of each file is
-  rounded up to alignment for the write and `ftruncate`'d back to its
-  true length at close. Use `--no-bcast-direct` on filesystems that
-  don't support `O_DIRECT` (NFS, some FUSE mounts).
-- **`--verify`** on `azcp-cluster`. After bcast, every rank computes
-  MD5 of every local file (rayon-parallel), `MPI_Allgather`s the
-  digests, and rank 0 cross-checks. Where the source blob has a
-  `Content-MD5` (typically only blobs uploaded as a single block), the
-  digest is also compared against that. Mismatch logs the offending
-  file and aborts with exit 7. Cost on the 16-node / 413 GiB / 524-file
-  reference: ~25-30 s.
+#### `azcp-cluster`
+
+- **`--bcast-writers N`** (default `2`). Fans completed bcast chunks
+  across N writer threads (dispatched by `file_id % N`) on receiver
+  ranks. Owner ranks are unaffected. Lifts the single-thread-buffered-
+  write bottleneck that capped the v0.2.1 receive path.
+- **`--bcast-direct`** (default **on**; opt out with `--no-bcast-direct`).
+  Opens output files with `O_DIRECT` and uses 4 KiB-aligned buffers; the
+  trailing partial chunk of each file is rounded up to alignment for the
+  write and `ftruncate`'d back to its true length at close. Use
+  `--no-bcast-direct` on filesystems that don't support `O_DIRECT` (NFS,
+  some FUSE mounts).
+- **`--verify`**. After bcast, every rank computes MD5 of every local
+  file (rayon-parallel), `MPI_Allgather`s the digests, and rank 0
+  cross-checks. Where the source blob has a `Content-MD5` (typically
+  only blobs uploaded as a single block), the digest is also compared
+  against that. Mismatch logs the offending file and aborts with
+  exit 7. Cost on the 16-node / 413 GiB / 524-file reference: ~25-30 s.
+- **`--download-ranks K`**. Restricts the Azure download stage to the
+  first K ranks (default: all ranks), so larger clusters can keep the
+  per-account egress fan-out bounded while still bcasting to all ranks
+  at fabric speed.
 - `BCAST_EXTRA_ARGS` env support in `tests/cluster_bench.sh` so the
   benchmark harness can sweep the new flags without script edits.
+
+#### `azcp` (single-node)
+
+- **`--direct`** on `azcp copy` (Linux only, no-op elsewhere). Opens
+  destination files with `O_DIRECT`, bypassing the page cache. On a
+  single GB300 ARM node with raided NVMe, end-to-end throughput on a
+  413 GiB / 524-file checkpoint rises from **74.2 Gbps** (buffered) to
+  **91.9 Gbps** — about a **24 % uplift** — by avoiding write-back
+  contention with new incoming bytes once the cache fills. See
+  [docs/performance-tuning.md](docs/performance-tuning.md).
+- **`--max-bandwidth RATE`** on `azcp copy`. Aggregate token-bucket
+  rate limiter shared across all `--workers`. Accepts both bit-rate
+  (`Gbps`, `Mbps`, …) and byte-rate (`MiB/s`, `MB/s`, …) units. Useful
+  when sharing a NIC with other tenants or staying under a storage
+  account quota.
+
+### Fixed
+
+- **Rate-limiter refill is now elapsed-time based** (#4). The previous
+  implementation refilled by a fixed per-tick increment regardless of
+  scheduler delay, which under-counted available tokens on busy
+  runtimes and over-throttled the transfer. The bucket now refills
+  proportional to wall-clock elapsed since the last refill, which
+  tracks the configured rate within ~10 % over multi-second windows.
+- **Az-cli Bearer preferred over scraped SharedKey**. When the only
+  credential available is `az login`, `azcp` now tries the Bearer token
+  (RBAC) first and falls back to the scraped account key only on
+  failure. Storage accounts with `allowSharedKeyAccess=false` reject
+  the scraped key with 403; the new order makes those accounts work
+  out of the box.
 
 ### Performance
 
@@ -42,27 +80,46 @@ integrity check for the broadcast path.
   and end-to-end wall-clock dropped from **134 s → 48 s**. Updated
   reference table and tuning options in
   [docs/cluster-benchmarks.md](docs/cluster-benchmarks.md).
+- **`--direct` on single-node `azcp copy` — +24 % on raided NVMe.**
+  See above.
+
+### Changed
+
+- **Dropped jemalloc and mimalloc** (#6). The `jemalloc` / `mimalloc`
+  Cargo features and their `#[global_allocator]` blocks are removed;
+  `azcp` and `azcp-cluster` now ship with the system allocator only.
+  This was needed for clean operation on the GB300 64 KiB-page ARM
+  kernel (where jemalloc's compiled-in 4 KiB page assumption aborted
+  at startup) and removes a chunk of unsafe FFI from the dependency
+  graph at no measurable throughput cost.
 
 ### Documentation
 
 - `docs/cluster-benchmarks.md` rewritten as outline-of-options +
   measured numbers (drops the v0.2.0/v0.2.1 diagnostic arc, kept in
   git history).
-- `docs/performance-tuning.md` annotates the bottleneck-progression
-  table with `--discard` so it is clear those numbers are network-only
-  and exclude filesystem write overhead.
+- `docs/performance-tuning.md` leads with the **current single-node
+  GB300 baseline** (buffered vs `--direct` on raided NVMe), then frames
+  the rest of the doc as the deeper download-path investigation
+  (`--discard` measurements, hostNetwork, NUMA, multi-process).
+- `docs/cluster-aks.md` post-bcast verification now points at
+  `--verify` (per-rank MD5 + `MPI_Allgather`) instead of suggesting an
+  ad-hoc spot-check md5.
 - `README.md` clarifies the credential resolution order: SAS in URL is
   rank 1 (not workload identity), and the az-cli row notes that Bearer
   is preferred over scraped SharedKey since accounts with
   `allowSharedKeyAccess=false` reject the latter with 403.
+- `examples/aks/` and `examples/slurm/` gain
+  download-then-train init-container patterns.
 
 ### Notes
 
 No backwards-incompatible CLI changes. Existing scripts continue to
-work; the only behavioural change is that bcast output now uses
-`O_DIRECT` by default. If your destination filesystem doesn't support
-`O_DIRECT`, add `--no-bcast-direct`. New image:
-`ghcr.io/edwardsp/azcp/azcp-cluster:v0.3.0`.
+work; the only behavioural change is that **`azcp-cluster` bcast
+output now uses `O_DIRECT` by default** — if your destination
+filesystem doesn't support `O_DIRECT`, add `--no-bcast-direct`. The
+`azcp copy --direct` flag is opt-in and defaults to off. New images:
+`ghcr.io/edwardsp/azcp/azcp-cluster:v0.3.0` and `:latest`.
 
 ## [v0.2.1] — 2026-05
 
