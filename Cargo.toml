@@ -30,22 +30,13 @@ humansize = "2"
 globset = "0.4"
 md-5 = "0.10"
 pprof = { version = "0.14", features = ["flamegraph"], optional = true }
-mimalloc = { version = "0.1", default-features = false, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-# tikv-jemallocator only compiles on non-MSVC targets (needs cmake + C toolchain).
-# Gated as a target-conditional optional dep so default-on works on linux/darwin
-# and is silently skipped on Windows MSVC builds.
-[target.'cfg(not(target_env = "msvc"))'.dependencies]
-tikv-jemallocator = { version = "0.6", optional = true }
-
 [features]
-default = ["jemalloc"]
+default = []
 profile = ["dep:pprof"]
-jemalloc = ["dep:tikv-jemallocator"]
-mimalloc-allocator = ["dep:mimalloc"]
 
 [dev-dependencies]
 tempfile = "3"
