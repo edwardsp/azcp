@@ -23,6 +23,7 @@ pub struct TransferConfig {
     pub shard: Option<(usize, usize)>,
     pub shardlist: Option<PathBuf>,
     pub max_bandwidth_bytes_per_sec: Option<u64>,
+    pub direct: bool,
 }
 
 impl Default for TransferConfig {
@@ -43,6 +44,7 @@ impl Default for TransferConfig {
             shard: None,
             shardlist: None,
             max_bandwidth_bytes_per_sec: None,
+            direct: false,
         }
     }
 }
