@@ -177,6 +177,52 @@ spec:
 pod shares the host's network namespace, so coordinate port usage with
 anything else running on the node.
 
+## `--direct` (O_DIRECT writes, opt-in)
+
+Pass `--direct` on `azcp copy` (Linux only, no-op elsewhere) to open every
+destination file with `O_DIRECT`, bypassing the kernel page cache. Writes
+go straight from the HTTP response buffer to disk, which avoids the
+write-back churn that competes with new incoming bytes once the page cache
+fills.
+
+Measured on a single GB300 ARM node (NVMe at `/mnt/nvme`, `--workers 8
+--concurrency 32 --parallel-files 4 --block-size 16777216`) downloading a
+413 GiB / 524-file checkpoint:
+
+| Mode       | Median Gbps | Best Gbps | Wall (median) |
+|---|---|---|---|
+| Buffered   | 74.2 | 78.7 | 44.5s |
+| `--direct` | 91.9 | 95.0 | 36.0s |
+
+About a **24% throughput uplift** on this workload, with the variance
+band still dominated by Azure storage tail latency (p99 ~1-2s either way).
+Three runs each, no retries, cold page cache between runs (`drop_caches`
+in init). The bench harness lives at `bench/run-direct.sh` (untracked).
+
+Use `--direct` when:
+
+- The destination is a fast local SSD/NVMe and you don't need the data in
+  the page cache afterwards (model checkpoints loaded once into GPU
+  memory; bulk dataset stages where the next consumer mmaps fresh).
+- The host has limited RAM relative to the transfer size, and write-back
+  pressure is dragging the steady-state throughput down.
+
+Skip `--direct` when:
+
+- You'll re-read the data immediately on the same host (training jobs
+  reading the just-downloaded checkpoint benefit from the cached pages).
+- The destination is a network filesystem (NFS / CIFS / Lustre) — those
+  layers translate `O_DIRECT` themselves and the semantics get fuzzy.
+- The destination block device doesn't accept 4 KiB-aligned writes (rare;
+  `tmpfs` and overlayfs reject `O_DIRECT` outright with `EINVAL`).
+
+Internally `azcp` writes each block through a 4 KiB-aligned scratch buffer
+(HTTP response bytes are not naturally aligned), pads the final block of
+each file to the alignment boundary, and `ftruncate`s back to the exact
+file size after all blocks of that file complete successfully. The aligned
+copy adds ~1 ms per 8 MiB at modern memory bandwidth — negligible next to
+the network transfer time at 25 Gb/s/worker.
+
 ## Account-level ceiling
 
 Once a single node is doing 170-200 Gbps, the next ceiling you'll hit is
