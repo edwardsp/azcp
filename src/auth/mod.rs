@@ -91,6 +91,14 @@ impl Credential {
             Err(e) => return Err(e),
         }
 
+        // Prefer az-cli Bearer (RBAC) over az-cli scraped SharedKey: many
+        // accounts disable `allowSharedKeyAccess`, in which case `az storage
+        // account keys list` still returns a key (management plane) but Azure
+        // rejects it on data-plane use with 403 KeyBasedAuthenticationNotPermitted.
+        if let Ok(token) = az_cli::get_storage_token() {
+            return Ok(Some(Credential::Bearer { token }));
+        }
+
         if let Ok(key) = az_cli::get_account_key(account_name) {
             return Ok(Some(Credential::SharedKey {
                 account: account_name.to_string(),
@@ -98,9 +106,6 @@ impl Credential {
             }));
         }
 
-        match az_cli::get_storage_token() {
-            Ok(token) => Ok(Some(Credential::Bearer { token })),
-            Err(_) => Ok(None),
-        }
+        Ok(None)
     }
 }
