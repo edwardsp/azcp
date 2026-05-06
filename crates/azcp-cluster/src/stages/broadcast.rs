@@ -1,8 +1,10 @@
+use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::Read;
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::ptr::NonNull;
 use std::sync::mpsc::{self, TryRecvError};
 use std::thread;
 
@@ -16,6 +18,43 @@ use azcp::BlobItem;
 use crate::cli::Args;
 use crate::paths::local_rel;
 use crate::stages::presence::Presence;
+
+const ALIGN: usize = 4096;
+
+struct AlignedBuf {
+    ptr: NonNull<u8>,
+    cap: usize,
+}
+
+unsafe impl Send for AlignedBuf {}
+
+impl AlignedBuf {
+    fn new(cap: usize) -> Result<Self> {
+        let layout = Layout::from_size_align(cap, ALIGN)
+            .map_err(|e| anyhow!("invalid bcast buffer layout (cap={cap}): {e}"))?;
+        let ptr = unsafe { alloc_zeroed(layout) };
+        let ptr = NonNull::new(ptr).ok_or_else(|| anyhow!("alloc {cap} bytes failed"))?;
+        Ok(Self { ptr, cap })
+    }
+    fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.cap) }
+    }
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.cap) }
+    }
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.ptr.as_ptr()
+    }
+}
+
+impl Drop for AlignedBuf {
+    fn drop(&mut self) {
+        unsafe {
+            let layout = Layout::from_size_align_unchecked(self.cap, ALIGN);
+            dealloc(self.ptr.as_ptr(), layout);
+        }
+    }
+}
 
 struct FileCtx {
     reader: Option<File>,
@@ -39,13 +78,14 @@ enum WriterCmd {
     OpenFile {
         file_id: usize,
         file: File,
+        size: u64,
     },
     Write {
         file_id: usize,
         slot: usize,
         n: usize,
         offset: u64,
-        buf: Vec<u8>,
+        buf: AlignedBuf,
     },
     CloseFile {
         file_id: usize,
@@ -54,7 +94,7 @@ enum WriterCmd {
 
 struct WriteAck {
     slot: usize,
-    buf: Vec<u8>,
+    buf: AlignedBuf,
     err: Option<anyhow::Error>,
 }
 
@@ -68,18 +108,36 @@ pub fn run(
     let rank = world.rank() as usize;
     let chunk: usize = args.bcast_chunk;
     let depth: usize = args.bcast_pipeline.max(1);
+    let num_writers: usize = args.bcast_writers.max(1);
+    let direct: bool = !args.no_bcast_direct;
 
-    let mut buffers: Vec<Vec<u8>> = (0..depth).map(|_| vec![0u8; chunk]).collect();
+    if direct && chunk % ALIGN != 0 {
+        return Err(anyhow!(
+            "--bcast-direct requires --bcast-chunk to be a multiple of {ALIGN} (got {chunk})"
+        ));
+    }
+
+    let mut buffers: Vec<Option<AlignedBuf>> = (0..depth)
+        .map(|_| AlignedBuf::new(chunk).map(Some))
+        .collect::<Result<_>>()?;
     let mut free_slots: VecDeque<usize> = (0..depth).collect();
     let mut in_flight: Vec<InFlight> = Vec::with_capacity(depth);
 
-    let (cmd_tx, cmd_rx) = mpsc::channel::<WriterCmd>();
     let (ack_tx, ack_rx) = mpsc::channel::<WriteAck>();
 
-    let writer = thread::Builder::new()
-        .name("bcast-writer".into())
-        .spawn(move || writer_loop(cmd_rx, ack_tx))
-        .context("spawn writer thread")?;
+    let mut cmd_txs: Vec<mpsc::Sender<WriterCmd>> = Vec::with_capacity(num_writers);
+    let mut writer_handles = Vec::with_capacity(num_writers);
+    for i in 0..num_writers {
+        let (cmd_tx_i, cmd_rx_i) = mpsc::channel::<WriterCmd>();
+        let ack_tx_i = ack_tx.clone();
+        let h = thread::Builder::new()
+            .name(format!("bcast-writer-{i}"))
+            .spawn(move || writer_loop(cmd_rx_i, ack_tx_i, direct))
+            .context("spawn writer thread")?;
+        cmd_txs.push(cmd_tx_i);
+        writer_handles.push(h);
+    }
+    drop(ack_tx);
 
     let result = drive_pipeline(
         world,
@@ -89,17 +147,31 @@ pub fn run(
         presence,
         rank,
         chunk,
+        direct,
         &mut buffers,
         &mut free_slots,
         &mut in_flight,
-        &cmd_tx,
+        &cmd_txs,
         &ack_rx,
     );
 
-    drop(cmd_tx);
-    let writer_result = writer
-        .join()
-        .map_err(|_| anyhow!("writer thread panicked"))?;
+    drop(cmd_txs);
+    let mut writer_result: Result<()> = Ok(());
+    for h in writer_handles {
+        match h.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                if writer_result.is_ok() {
+                    writer_result = Err(e);
+                }
+            }
+            Err(_) => {
+                if writer_result.is_ok() {
+                    writer_result = Err(anyhow!("writer thread panicked"));
+                }
+            }
+        }
+    }
 
     result.and(writer_result)
 }
@@ -113,10 +185,11 @@ fn drive_pipeline(
     presence: &Presence,
     rank: usize,
     chunk: usize,
-    buffers: &mut [Vec<u8>],
+    direct: bool,
+    buffers: &mut [Option<AlignedBuf>],
     free_slots: &mut VecDeque<usize>,
     in_flight: &mut Vec<InFlight>,
-    cmd_tx: &mpsc::Sender<WriterCmd>,
+    cmd_txs: &[mpsc::Sender<WriterCmd>],
     ack_rx: &mpsc::Receiver<WriteAck>,
 ) -> Result<()> {
     let mut files: Vec<Option<FileCtx>> = Vec::with_capacity(plan.len());
@@ -155,22 +228,24 @@ fn drive_pipeline(
                     }
                 } else if !already_have {
                     ensure_parent(&local_path)?;
-                    let w = OpenOptions::new()
-                        .create(true)
-                        .write(true)
-                        .truncate(true)
+                    let mut opts = OpenOptions::new();
+                    opts.create(true).write(true).truncate(true);
+                    if direct && size > 0 {
+                        opts.custom_flags(libc::O_DIRECT);
+                    }
+                    let w = opts
                         .open(&local_path)
                         .with_context(|| format!("receiver create {}", local_path.display()))?;
                     if size == 0 {
-                        // Zero-byte file: created and truncated; no chunks will flow.
-                        // Drop on this thread to release the fd immediately.
                         drop(w);
                         (None, false)
                     } else {
-                        cmd_tx
+                        let file_id = files.len();
+                        cmd_txs[file_id % cmd_txs.len()]
                             .send(WriterCmd::OpenFile {
-                                file_id: files.len(),
+                                file_id,
                                 file: w,
+                                size,
                             })
                             .map_err(|_| anyhow!("writer thread closed"))?;
                         (None, true)
@@ -203,13 +278,13 @@ fn drive_pipeline(
             let n = ctx.remaining_to_post.min(chunk as u64) as usize;
             let offset = ctx.next_post_offset;
             let slot = free_slots.pop_front().unwrap();
-            let buf = &mut buffers[slot];
+            let buf = buffers[slot].as_mut().expect("free slot has buffer");
 
             if ctx.is_owner {
                 ctx.reader
                     .as_mut()
                     .unwrap()
-                    .read_exact(&mut buf[..n])
+                    .read_exact(&mut buf.as_mut_slice()[..n])
                     .with_context(|| {
                         format!("owner read {} bytes from {}", n, ctx.path.display())
                     })?;
@@ -252,7 +327,7 @@ fn drive_pipeline(
                     if let Some(e) = ack.err {
                         return Err(e);
                     }
-                    buffers[ack.slot] = ack.buf;
+                    buffers[ack.slot] = Some(ack.buf);
                     free_slots.push_back(ack.slot);
                     writes_pending -= 1;
                 }
@@ -274,7 +349,7 @@ fn drive_pipeline(
             if let Some(e) = ack.err {
                 return Err(e);
             }
-            buffers[ack.slot] = ack.buf;
+            buffers[ack.slot] = Some(ack.buf);
             free_slots.push_back(ack.slot);
             writes_pending -= 1;
             continue;
@@ -301,10 +376,10 @@ fn drive_pipeline(
         let file_finished = ctx.chunks_in_flight == 0 && ctx.remaining_to_post == 0;
 
         if ctx.needs_write {
-            // Hand the buffer to the writer; replace with an empty Vec so the
-            // slot is reserved until the writer returns it.
-            let buf = std::mem::take(&mut buffers[done.slot]);
-            cmd_tx
+            let buf = buffers[done.slot]
+                .take()
+                .expect("slot must hold buffer at completion");
+            cmd_txs[done.file_id % cmd_txs.len()]
                 .send(WriterCmd::Write {
                     file_id: done.file_id,
                     slot: done.slot,
@@ -320,7 +395,7 @@ fn drive_pipeline(
 
         if file_finished {
             if ctx.needs_write {
-                cmd_tx
+                cmd_txs[done.file_id % cmd_txs.len()]
                     .send(WriterCmd::CloseFile {
                         file_id: done.file_id,
                     })
@@ -333,13 +408,21 @@ fn drive_pipeline(
     Ok(())
 }
 
-fn writer_loop(cmd_rx: mpsc::Receiver<WriterCmd>, ack_tx: mpsc::Sender<WriteAck>) -> Result<()> {
-    let mut files: HashMap<usize, File> = HashMap::new();
+fn writer_loop(
+    cmd_rx: mpsc::Receiver<WriterCmd>,
+    ack_tx: mpsc::Sender<WriteAck>,
+    direct: bool,
+) -> Result<()> {
+    let mut files: HashMap<usize, (File, u64)> = HashMap::new();
     let mut deferred_err: Option<anyhow::Error> = None;
     while let Ok(cmd) = cmd_rx.recv() {
         match cmd {
-            WriterCmd::OpenFile { file_id, file } => {
-                files.insert(file_id, file);
+            WriterCmd::OpenFile {
+                file_id,
+                file,
+                size,
+            } => {
+                files.insert(file_id, (file, size));
             }
             WriterCmd::Write {
                 file_id,
@@ -349,10 +432,21 @@ fn writer_loop(cmd_rx: mpsc::Receiver<WriterCmd>, ack_tx: mpsc::Sender<WriteAck>
                 buf,
             } => {
                 let err = match files.get(&file_id) {
-                    Some(w) => w
-                        .write_all_at(&buf[..n], offset)
-                        .err()
-                        .map(|e| anyhow!("write file_id={file_id} offset={offset}: {e}")),
+                    Some((w, _size)) => {
+                        // O_DIRECT requires the write length to be a multiple of the
+                        // block size. The trailing chunk of a file may be shorter; round
+                        // up (writing junk past EOF from prior buffer contents) and fix
+                        // the tail at CloseFile via ftruncate to the true size.
+                        let write_len = if direct {
+                            (n + ALIGN - 1) & !(ALIGN - 1)
+                        } else {
+                            n
+                        };
+                        let write_len = write_len.min(buf.cap);
+                        w.write_all_at(&buf.as_slice()[..write_len], offset)
+                            .err()
+                            .map(|e| anyhow!("write file_id={file_id} offset={offset}: {e}"))
+                    }
                     None => Some(anyhow!("write to unknown file_id={file_id}")),
                 };
                 if ack_tx.send(WriteAck { slot, buf, err }).is_err() {
@@ -360,7 +454,15 @@ fn writer_loop(cmd_rx: mpsc::Receiver<WriterCmd>, ack_tx: mpsc::Sender<WriteAck>
                 }
             }
             WriterCmd::CloseFile { file_id } => {
-                if let Some(f) = files.remove(&file_id) {
+                if let Some((f, size)) = files.remove(&file_id) {
+                    if direct {
+                        if let Err(e) = f.set_len(size) {
+                            if deferred_err.is_none() {
+                                deferred_err = Some(anyhow!("ftruncate file_id={file_id}: {e}"));
+                            }
+                            continue;
+                        }
+                    }
                     if let Err(e) = f.sync_all() {
                         if deferred_err.is_none() {
                             deferred_err = Some(anyhow!("close file_id={file_id}: {e}"));

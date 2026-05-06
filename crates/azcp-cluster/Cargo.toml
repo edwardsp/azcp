@@ -1,8 +1,7 @@
 [package]
 name = "azcp-cluster"
 version = "0.2.0"
-edition = "2021"
-description = "MPI-based cluster broadcast copy for azcp"
+edition = "2024"
 
 [dependencies]
 azcp = { path = "../.." }
@@ -10,3 +9,4 @@ mpi = "0.7"
 clap = { version = "4", features = ["derive", "env"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 anyhow = "1"
+libc = "0.2"

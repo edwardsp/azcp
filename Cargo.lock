@@ -169,6 +169,7 @@ dependencies = [
  "anyhow",
  "azcp",
  "clap",
+ "libc",
  "mpi",
  "tokio",
 ]
