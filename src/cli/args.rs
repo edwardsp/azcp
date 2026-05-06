@@ -19,6 +19,69 @@ pub fn resolve_progress(progress: bool, no_progress: bool) -> bool {
     std::io::stderr().is_terminal()
 }
 
+// Parse a human-readable bandwidth string into bytes/sec.
+//
+// Accepts both bit-rate and byte-rate units, decimal (powers of 1000) and
+// binary (powers of 1024), with or without a "/s" suffix. Examples:
+//   50Gbps, 200Mbps, 1Gbps          (bits per second, decimal)
+//   1GB/s, 500MB/s, 100KB/s         (bytes per second, decimal)
+//   500MiB/s, 1GiB/s                (bytes per second, binary)
+//   8000000                         (bare = bytes per second)
+pub fn parse_bandwidth(s: &str) -> Result<u64, String> {
+    let raw = s.trim();
+    if raw.is_empty() {
+        return Err("empty bandwidth value".into());
+    }
+    let lower = raw.to_lowercase();
+    let body = lower.strip_suffix("/s").unwrap_or(&lower);
+
+    let split = body
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(body.len());
+    let (num_str, unit) = body.split_at(split);
+    if num_str.is_empty() {
+        return Err(format!(
+            "bandwidth must start with a number, got {s:?} \
+             (try e.g. 50Gbps, 1GB/s, 500MiB/s)"
+        ));
+    }
+    let num: f64 = num_str
+        .parse()
+        .map_err(|_| format!("bad bandwidth number {num_str:?} in {s:?}"))?;
+    if num < 0.0 || !num.is_finite() {
+        return Err(format!("bandwidth must be positive and finite, got {s:?}"));
+    }
+
+    let multiplier: f64 = match unit.trim() {
+        "" | "b" | "byte" | "bytes" => 1.0,
+        "kb" => 1_000.0,
+        "mb" => 1_000_000.0,
+        "gb" => 1_000_000_000.0,
+        "tb" => 1_000_000_000_000.0,
+        "kib" => 1024.0,
+        "mib" => 1024.0 * 1024.0,
+        "gib" => 1024.0 * 1024.0 * 1024.0,
+        "tib" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        "bps" => 1.0 / 8.0,
+        "kbps" => 1_000.0 / 8.0,
+        "mbps" => 1_000_000.0 / 8.0,
+        "gbps" => 1_000_000_000.0 / 8.0,
+        "tbps" => 1_000_000_000_000.0 / 8.0,
+        other => {
+            return Err(format!(
+                "unknown bandwidth unit {other:?} in {s:?} \
+                 (try Gbps, Mbps, GB/s, MiB/s, GiB/s, ...)"
+            ))
+        }
+    };
+
+    let bytes_per_sec = (num * multiplier).round();
+    if bytes_per_sec < 1.0 {
+        return Err(format!("bandwidth {s:?} rounds to 0 bytes/sec"));
+    }
+    Ok(bytes_per_sec as u64)
+}
+
 pub fn parse_shard(s: &str) -> Result<(usize, usize), String> {
     let (i, n) = s
         .split_once('/')
@@ -153,6 +216,14 @@ pub struct CopyArgs {
         help = "Read source blob listing from FILE (TSV: <name>\\t<size>[\\t<modified>]) instead of calling LIST. Generate with: azcp ls <url> --recursive --machine-readable > FILE. Download-only."
     )]
     pub shardlist: Option<PathBuf>,
+
+    #[arg(
+        long,
+        value_name = "RATE",
+        value_parser = parse_bandwidth,
+        help = "Cap aggregate throughput across all workers. Accepts bit-rate (e.g. 50Gbps, 200Mbps) or byte-rate (e.g. 1GB/s, 500MiB/s, 100KB/s). Applies to both uploads and downloads."
+    )]
+    pub max_bandwidth: Option<u64>,
 }
 
 #[derive(Args)]
@@ -284,4 +355,56 @@ pub struct RemoveArgs {
 #[derive(Args)]
 pub struct MakeArgs {
     pub url: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bandwidth_bit_units() {
+        assert_eq!(parse_bandwidth("8bps").unwrap(), 1);
+        assert_eq!(parse_bandwidth("1Kbps").unwrap(), 125);
+        assert_eq!(parse_bandwidth("1Mbps").unwrap(), 125_000);
+        assert_eq!(parse_bandwidth("1Gbps").unwrap(), 125_000_000);
+        assert_eq!(parse_bandwidth("50Gbps").unwrap(), 6_250_000_000);
+        assert_eq!(parse_bandwidth("200Mbps").unwrap(), 25_000_000);
+    }
+
+    #[test]
+    fn bandwidth_byte_units_decimal() {
+        assert_eq!(parse_bandwidth("1KB/s").unwrap(), 1_000);
+        assert_eq!(parse_bandwidth("1MB/s").unwrap(), 1_000_000);
+        assert_eq!(parse_bandwidth("1GB/s").unwrap(), 1_000_000_000);
+        assert_eq!(parse_bandwidth("500MB/s").unwrap(), 500_000_000);
+    }
+
+    #[test]
+    fn bandwidth_byte_units_binary() {
+        assert_eq!(parse_bandwidth("1KiB/s").unwrap(), 1024);
+        assert_eq!(parse_bandwidth("1MiB/s").unwrap(), 1024 * 1024);
+        assert_eq!(parse_bandwidth("500MiB/s").unwrap(), 500 * 1024 * 1024);
+        assert_eq!(parse_bandwidth("1GiB/s").unwrap(), 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn bandwidth_bare_bytes() {
+        assert_eq!(parse_bandwidth("12345").unwrap(), 12345);
+        assert_eq!(parse_bandwidth("1000000").unwrap(), 1_000_000);
+    }
+
+    #[test]
+    fn bandwidth_case_insensitive() {
+        assert_eq!(parse_bandwidth("50gbps").unwrap(), 6_250_000_000);
+        assert_eq!(parse_bandwidth("1gib/s").unwrap(), 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn bandwidth_rejects_garbage() {
+        assert!(parse_bandwidth("").is_err());
+        assert!(parse_bandwidth("nope").is_err());
+        assert!(parse_bandwidth("100xyz").is_err());
+        assert!(parse_bandwidth("-5Gbps").is_err());
+        assert!(parse_bandwidth("0.0001bps").is_err());
+    }
 }

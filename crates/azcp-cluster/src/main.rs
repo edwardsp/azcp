@@ -119,7 +119,31 @@ fn main() -> ExitCode {
         .iter()
         .map(|&i| entries[i].clone())
         .collect();
-    let download_owners = stages::owners::compute(&download_entries, size as usize);
+
+    let total_ranks = size as usize;
+    let download_rank_count = match args.download_ranks {
+        Some(k) if k == 0 || k > total_ranks => {
+            if rank == 0 {
+                eprintln!("[fatal] --download-ranks {k} invalid (must be 1..={total_ranks})");
+            }
+            unsafe { ffi::MPI_Abort(world.as_raw(), 7) };
+            return ExitCode::from(7);
+        }
+        Some(k) => k,
+        None => total_ranks,
+    };
+    let per_rank_bandwidth = args
+        .max_bandwidth
+        .map(|bw| (bw / download_rank_count as u64).max(1));
+    let is_downloader = (rank as usize) < download_rank_count;
+    if rank == 0 && download_rank_count < total_ranks {
+        println!(
+            "[shard] {download_rank_count}/{total_ranks} ranks will download; \
+             remaining {} ranks bcast-only",
+            total_ranks - download_rank_count
+        );
+    }
+    let download_owners = stages::owners::compute(&download_entries, download_rank_count);
 
     let mut my_entries: Vec<BlobItem> = Vec::new();
     let mut bcast_plan: Vec<(usize, usize)> =
@@ -168,11 +192,11 @@ fn main() -> ExitCode {
         my_bytes
     );
 
-    let t_download = if matches!(args.stage, Stage::Bcast) {
+    let t_download = if matches!(args.stage, Stage::Bcast) || !is_downloader {
         0.0
     } else {
         let t0 = environment::time();
-        if let Err(err) = stages::download::run(&args, my_entries.clone()) {
+        if let Err(err) = stages::download::run(&args, my_entries.clone(), per_rank_bandwidth) {
             eprintln!("rank {rank}: download stage failed: {err:#}");
             unsafe { ffi::MPI_Abort(world.as_raw(), 5) };
             return ExitCode::from(5);

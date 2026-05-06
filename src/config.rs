@@ -22,6 +22,7 @@ pub struct TransferConfig {
     pub max_retries: u32,
     pub shard: Option<(usize, usize)>,
     pub shardlist: Option<PathBuf>,
+    pub max_bandwidth_bytes_per_sec: Option<u64>,
 }
 
 impl Default for TransferConfig {
@@ -41,6 +42,7 @@ impl Default for TransferConfig {
             max_retries: DEFAULT_MAX_RETRIES,
             shard: None,
             shardlist: None,
+            max_bandwidth_bytes_per_sec: None,
         }
     }
 }

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use crate::auth::Credential;
 use crate::config::TransferConfig;
 use crate::engine::progress::TransferProgress;
+use crate::engine::rate_limiter::RateLimiter;
 use crate::engine::{TransferEngine, TransferSummary};
 use crate::error::{AzcpError, Result};
 use crate::storage::blob::client::{BlobClient, LatencyStats, RetryStats};
@@ -16,6 +17,7 @@ pub struct SharedTransfer {
     pub progress: Option<Arc<TransferProgress>>,
     pub retry_stats: Option<Arc<RetryStats>>,
     pub latency_stats: Option<Arc<LatencyStats>>,
+    pub rate_limiter: Option<Arc<RateLimiter>>,
 }
 
 pub async fn run(args: &CopyArgs) -> Result<()> {
@@ -46,6 +48,7 @@ pub async fn run_with_shared(
         max_retries: args.max_retries,
         shard: args.shard,
         shardlist: args.shardlist.clone(),
+        max_bandwidth_bytes_per_sec: args.max_bandwidth,
     };
 
     match (&source, &dest) {
@@ -97,6 +100,9 @@ async fn upload(
     let mut engine = TransferEngine::new(client, config)?;
     if let Some(p) = &shared.progress {
         engine = engine.with_shared_progress(p.clone());
+    }
+    if let Some(rl) = &shared.rate_limiter {
+        engine = engine.with_rate_limiter(rl.clone());
     }
     let engine = Arc::new(engine);
 
@@ -171,6 +177,9 @@ async fn download(
     let mut engine = TransferEngine::new(client, config)?;
     if let Some(p) = &shared.progress {
         engine = engine.with_shared_progress(p.clone());
+    }
+    if let Some(rl) = &shared.rate_limiter {
+        engine = engine.with_rate_limiter(rl.clone());
     }
     let engine = Arc::new(engine);
 

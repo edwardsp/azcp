@@ -78,6 +78,20 @@ pub struct Args {
     #[arg(long, default_value_t = 5)]
     pub max_retries: u32,
 
+    /// Cap aggregate cluster download throughput. Accepts bit-rate
+    /// (50Gbps, 200Mbps) or byte-rate (1GB/s, 500MiB/s, 100KB/s).
+    /// The cap is divided across the active downloader ranks (see
+    /// --download-ranks); each rank gets total / K.
+    #[arg(long, value_name = "RATE", value_parser = azcp::cli::args::parse_bandwidth)]
+    pub max_bandwidth: Option<u64>,
+
+    /// Number of ranks that actually download from Azure (default: all
+    /// ranks). The remaining ranks skip the download phase and only
+    /// participate in MPI_Bcast. Useful when too many concurrent
+    /// downloaders against one storage account cause 503 throttling.
+    #[arg(long, value_name = "K")]
+    pub download_ranks: Option<usize>,
+
     /// Disable per-rank progress bars (default: TTY-aware)
     #[arg(long)]
     pub no_progress: bool,

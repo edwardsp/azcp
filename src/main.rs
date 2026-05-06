@@ -7,6 +7,7 @@ use azcp::cli;
 use azcp::cli::args::{Cli, Command, CopyArgs};
 use azcp::cli::copy::SharedTransfer;
 use azcp::engine::progress::TransferProgress;
+use azcp::engine::rate_limiter::RateLimiter;
 use azcp::engine::TransferSummary;
 use azcp::error::Result;
 use azcp::storage::blob::client::{LatencyStats, RetryStats};
@@ -94,6 +95,7 @@ fn run_workers(args: &CopyArgs) -> Result<()> {
     ));
     let shared_retry = Arc::new(RetryStats::default());
     let shared_latency = Arc::new(LatencyStats::default());
+    let shared_rate = args.max_bandwidth.map(RateLimiter::new);
 
     let started = std::time::Instant::now();
 
@@ -102,10 +104,12 @@ fn run_workers(args: &CopyArgs) -> Result<()> {
             let mut a = args.clone();
             a.shard = Some((i, n));
             a.workers = 1;
+            a.max_bandwidth = None;
             let shared = SharedTransfer {
                 progress: Some(shared_progress.clone()),
                 retry_stats: Some(shared_retry.clone()),
                 latency_stats: Some(shared_latency.clone()),
+                rate_limiter: shared_rate.clone(),
             };
             std::thread::Builder::new()
                 .name(format!("azcp-w{i}"))

@@ -93,6 +93,8 @@ azcp-cluster <SOURCE> <DEST> [flags]
 | `--bcast-chunk N` | 64 MiB | Chunk size for `MPI_Bcast`. Tune for fabric — see [Tuning](#tuning) below. |
 | `--bcast-pipeline N` | 4 | Number of bcast chunks in flight per file. Higher = more pipelining, more memory. |
 | `--max-retries N` | 5 | Per-HTTP-request retry budget. |
+| `--max-bandwidth RATE` | (off) | Cap **total cluster** download throughput. Accepts bit/byte units (`50Gbps`, `1GB/s`, `500MiB/s`). Divided across active downloader ranks: each gets `RATE / K`. See [Throughput limits](#throughput-limits) below. |
+| `--download-ranks K` | (= world size) | Only ranks `0..K-1` download from Azure; the remaining ranks skip the download phase and only receive via `MPI_Bcast`. Use to avoid 503 throttling when too many ranks hit one storage account. See [Limiting downloader count](#limiting-downloader-count) below. |
 | `--no-progress` | — | Disable per-rank progress bars (default: TTY-aware). |
 
 ## Stages and timing output
@@ -146,6 +148,53 @@ matter for bcast performance:
 For first-run tuning, start with the defaults and the `[bcast] BW` line
 is your scoreboard. See [cluster-benchmarks.md](cluster-benchmarks.md) for
 empirical sweep results.
+
+### Throughput limits
+
+`--max-bandwidth RATE` caps the cluster's **aggregate** download bandwidth.
+Internally each downloader rank gets `RATE / K` (where K is the active
+downloader count, see below). Accepts the same units as the single-process
+flag: `50Gbps`, `200Mbps`, `1GB/s`, `500MiB/s`, etc.
+
+```bash
+mpirun ... azcp-cluster <src> <dst> --max-bandwidth 100Gbps
+```
+
+Common reasons to set this:
+
+- **Quota-friendly**: stay under a known storage account egress ceiling
+  (typically 60-230 Gbps depending on tier and account class) so 503s
+  don't dominate the run.
+- **Shared infrastructure**: cap so concurrent jobs on the same storage
+  account or NIC don't collide.
+
+The cap only applies to the **download** stage; `MPI_Bcast` over the
+cluster fabric is not throttled.
+
+### Limiting downloader count
+
+`--download-ranks K` restricts the download phase to the first K ranks
+(rank 0..K-1). The remaining ranks sit idle during download and only
+participate in `MPI_Bcast`. Defaults to all ranks.
+
+```bash
+mpirun -np 64 ... azcp-cluster <src> <dst> --download-ranks 8
+```
+
+When to use it:
+
+- **Throttling**: 64+ ranks hitting one storage account simultaneously
+  often causes 503 storms. Restrict to 8-16 downloaders, then rely on
+  bcast to fan out to the other ranks at fabric speed (which is far
+  faster than re-trying throttled GETs anyway).
+- **NIC fairness**: if some nodes have weaker uplinks or are noisy
+  neighbours, exclude them from the download phase.
+
+The split is deterministic: the LPT bin-packer divides the dataset into
+K size-balanced shards (just as for K=N), and the broadcast plan is
+computed from "who owns the file", so receiver ranks don't need to know
+or care which subset is K. Combined with `--max-bandwidth`, each of the K
+downloaders gets `total / K` bytes/sec.
 
 ## Skip-on-rerun (`--compare`)
 

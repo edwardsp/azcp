@@ -9,7 +9,7 @@ use azcp::{
 
 use crate::cli::Args;
 
-pub fn run(args: &Args, my_entries: Vec<BlobItem>) -> Result<()> {
+pub fn run(args: &Args, my_entries: Vec<BlobItem>, max_bandwidth: Option<u64>) -> Result<()> {
     if my_entries.is_empty() {
         return Ok(());
     }
@@ -44,6 +44,7 @@ pub fn run(args: &Args, my_entries: Vec<BlobItem>) -> Result<()> {
         max_retries: args.max_retries,
         shard: None,
         shardlist: None,
+        max_bandwidth_bytes_per_sec: max_bandwidth,
     };
 
     let engine = TransferEngine::new(client, config)

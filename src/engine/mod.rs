@@ -1,4 +1,5 @@
 pub mod progress;
+pub mod rate_limiter;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -18,6 +19,7 @@ use crate::storage::blob::models::{BlockListEntry, UploadOptions};
 use crate::storage::local;
 
 use self::progress::TransferProgress;
+use self::rate_limiter::RateLimiter;
 
 pub struct TransferEngine {
     client: Arc<BlobClient>,
@@ -34,6 +36,7 @@ pub struct TransferEngine {
     // file-by-file dispatch bottleneck.
     file_semaphore: Arc<Semaphore>,
     shared_progress: Option<Arc<TransferProgress>>,
+    rate_limiter: Option<Arc<RateLimiter>>,
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +54,7 @@ impl TransferEngine {
         let exclude = build_glob_set(config.exclude_pattern.as_deref())?;
         let semaphore = Arc::new(Semaphore::new(config.concurrency));
         let file_semaphore = Arc::new(Semaphore::new(config.parallel_files.max(1)));
+        let rate_limiter = config.max_bandwidth_bytes_per_sec.map(RateLimiter::new);
         Ok(Self {
             client: Arc::new(client),
             config,
@@ -59,11 +63,17 @@ impl TransferEngine {
             semaphore,
             file_semaphore,
             shared_progress: None,
+            rate_limiter,
         })
     }
 
     pub fn with_shared_progress(mut self, progress: Arc<TransferProgress>) -> Self {
         self.shared_progress = Some(progress);
+        self
+    }
+
+    pub fn with_rate_limiter(mut self, limiter: Arc<RateLimiter>) -> Self {
+        self.rate_limiter = Some(limiter);
         self
     }
 
@@ -116,6 +126,9 @@ impl TransferEngine {
                 None
             };
             let _permit = self.semaphore.acquire().await.unwrap();
+            if let Some(rl) = &self.rate_limiter {
+                rl.acquire(file_size).await;
+            }
             self.client
                 .put_blob(
                     account,
@@ -198,6 +211,7 @@ impl TransferEngine {
         while let Some((block_id, chunk)) = rx.recv().await {
             let client = self.client.clone();
             let sem = self.semaphore.clone();
+            let rl = self.rate_limiter.clone();
             let acct = account.to_string();
             let ctr = container.to_string();
             let bp = blob_path.to_string();
@@ -205,6 +219,9 @@ impl TransferEngine {
             tasks.spawn(async move {
                 let _permit = sem.acquire().await.unwrap();
                 let chunk_len = chunk.len() as u64;
+                if let Some(rl) = &rl {
+                    rl.acquire(chunk_len).await;
+                }
                 client.put_block(&acct, &ctr, &bp, &block_id, chunk).await?;
                 if let Some(pb) = &pb {
                     pb.inc(chunk_len);
@@ -257,6 +274,9 @@ impl TransferEngine {
 
         let written = if size < self.config.block_size {
             let permit = self.semaphore.acquire().await.unwrap();
+            if let Some(rl) = &self.rate_limiter {
+                rl.acquire(size.max(1)).await;
+            }
             let data = self.client.get_blob(account, container, blob_path).await?;
             drop(permit);
             let len = data.len() as u64;
@@ -318,6 +338,7 @@ impl TransferEngine {
 
             let client = self.client.clone();
             let sem = self.semaphore.clone();
+            let rl = self.rate_limiter.clone();
             let acct = account.to_string();
             let ctr = container.to_string();
             let bp = blob_path.to_string();
@@ -326,6 +347,9 @@ impl TransferEngine {
 
             tasks.spawn(async move {
                 let _permit = sem.acquire().await.unwrap();
+                if let Some(rl) = &rl {
+                    rl.acquire(length).await;
+                }
                 let data = client
                     .get_blob_range(&acct, &ctr, &bp, offset, length)
                     .await?;
@@ -517,6 +541,7 @@ impl TransferEngine {
                 let permit = self.semaphore.clone().acquire_owned().await.unwrap();
                 let block_id = block.id.clone();
                 let client = self.client.clone();
+                let rl = self.rate_limiter.clone();
                 let pb_c = pb.clone();
                 let prog_c = progress.clone();
                 let acct = account.to_string();
@@ -532,6 +557,9 @@ impl TransferEngine {
                     let mut buf = vec![0u8; this_size];
                     file.read_exact(&mut buf).await?;
                     let chunk_len = buf.len() as u64;
+                    if let Some(rl) = &rl {
+                        rl.acquire(chunk_len).await;
+                    }
                     client
                         .put_block(&acct, &ctr, &bp, &block_id, Bytes::from(buf))
                         .await?;
@@ -756,6 +784,7 @@ impl TransferEngine {
 
             let chunk_sem = self.semaphore.clone();
             let client = self.client.clone();
+            let rate_limiter = self.rate_limiter.clone();
             let progress_c = progress.clone();
             let acct = account.to_string();
             let ctr = container.to_string();
@@ -772,6 +801,9 @@ impl TransferEngine {
                     if file_size == 0 || file_size < block_size {
                         let result = async {
                             let permit = chunk_sem.acquire_owned().await.unwrap();
+                            if let Some(rl) = &rate_limiter {
+                                rl.acquire(file_size.max(1)).await;
+                            }
                             let data = client.get_blob(&acct, &ctr, &blob_name).await?;
                             drop(permit);
                             if check_md5 {
@@ -829,6 +861,7 @@ impl TransferEngine {
 
                         let permit = chunk_sem.clone().acquire_owned().await.unwrap();
                         let client_c = client.clone();
+                        let rl_c = rate_limiter.clone();
                         let acct_c = acct.clone();
                         let ctr_c = ctr.clone();
                         let blob_name_c = blob_name.clone();
@@ -838,6 +871,9 @@ impl TransferEngine {
 
                         block_handles.push(tokio::spawn(async move {
                             let _permit = permit;
+                            if let Some(rl) = &rl_c {
+                                rl.acquire(length).await;
+                            }
                             let data = client_c
                                 .get_blob_range(&acct_c, &ctr_c, &blob_name_c, offset, length)
                                 .await?;

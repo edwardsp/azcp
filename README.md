@@ -112,7 +112,7 @@ azcp copy ./src https://acct.blob.core.windows.net/ctr/backup/ \
   --recursive --include-pattern '*.rs' --exclude-pattern 'target/*'
 ```
 
-Flags: `--recursive`, `--no-overwrite`, `--block-size`, `--concurrency`, `--parallel-files`, `--workers`, `--shard`, `--shardlist`, `--max-retries`, `--dry-run`, `--check-md5`, `--include-pattern`, `--exclude-pattern`, `--progress`, `--no-progress`.
+Flags: `--recursive`, `--no-overwrite`, `--block-size`, `--concurrency`, `--parallel-files`, `--workers`, `--shard`, `--shardlist`, `--max-retries`, `--max-bandwidth`, `--dry-run`, `--check-md5`, `--include-pattern`, `--exclude-pattern`, `--progress`, `--no-progress`.
 
 > Progress display is **on by default when stderr is a TTY** and silenced
 > automatically when output is redirected (logs, CI, `kubectl logs`). Pass
@@ -283,6 +283,31 @@ but if you see throttle counts climb, Azure is telling you you've hit the
 account ingress/egress limit (typically ~60 Gbps ingress for standard storage;
 egress caps observed around ~230 Gbps before hard 503 storms). Lower
 concurrency, spread across multiple accounts, or request a quota increase.
+
+### Capping bandwidth
+
+`--max-bandwidth RATE` caps aggregate throughput across all workers (single
+process — for multi-process / multi-node, see [docs/cluster.md](docs/cluster.md)).
+Useful when sharing a NIC with other tenants or staying under a storage account
+quota. Accepts both bit-rate and byte-rate units:
+
+```bash
+azcp copy https://acct.blob.core.windows.net/ctr/ ./dst/ \
+  --recursive --workers 4 --max-bandwidth 50Gbps
+
+azcp copy ./big https://acct.blob.core.windows.net/ctr/ \
+  --recursive --max-bandwidth 500MiB/s
+```
+
+Accepted units: `Tbps`, `Gbps`, `Mbps`, `Kbps`, `bps` (bits/sec, decimal); `TB/s`,
+`GB/s`, `MB/s`, `KB/s` (bytes/sec, decimal); `TiB/s`, `GiB/s`, `MiB/s`, `KiB/s`
+(bytes/sec, binary). The trailing `/s` is optional. Bare numbers are bytes/sec.
+
+The cap is a token bucket sized to one period: in steady state actual
+throughput tracks the target within ~10% over multi-second windows. The
+limiter starts empty (no initial burst), so per-request latency for the
+very first request includes whatever wait is needed to mint enough tokens
+for that block.
 
 ### sync
 
