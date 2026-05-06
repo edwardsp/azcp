@@ -1,0 +1,256 @@
+---
+# Two-phase MPIJob: azcp-cluster downloads the dataset to per-node NVMe in
+# phase 1, then the same MPIJob immediately runs your training/inference
+# workload in phase 2 — same workers, same nodes, same allocation.
+#
+# Why this is the recommended AKS pattern (vs. two separate workloads):
+#   - Single Kueue/scheduler admission. The node allocation is held across
+#     both phases. No "another tenant grabs your nodes between stages."
+#   - No cross-workload sequencing. The phases are sequential bash commands
+#     in the launcher script — `mpirun phase1 && mpirun phase2`.
+#   - No node-pinning glue. Phase 2 runs on the same workers that phase 1
+#     populated, by definition.
+#   - Uses only mpi-operator (which you already have). No JobSet, no Kueue
+#     workflow features, no custom CRDs.
+#
+# Cost: the worker image must contain BOTH azcp-cluster and your training
+# stack. See examples/aks/Dockerfile.training for the minimal addition —
+# four COPY lines and one apt install on top of your existing PyTorch /
+# vLLM / NGC image. azcp-cluster's Open MPI + UCX live under /opt/azcp/
+# so they don't clash with HPC-X or anything else your base image ships.
+#
+# When this is the WRONG pattern:
+#   - Long-running serving (vLLM, Ray, Deployment-shaped consumers). For
+#     these, broadcast download is over-engineering — use per-pod init
+#     container with plain `azcp` and amortize the download cost across
+#     hours of serving.
+#   - Consumer must be a different CRD that genuinely cannot fit inside
+#     an MPIJob worker (rare). See "Scheduling considerations" at the
+#     bottom of this file.
+#
+# Edit before applying:
+#   - REPLACE_WITH_REGISTRY/azcp-train:TAG: your merged image
+#   - SOURCE_URL: blob prefix to broadcast
+#   - AZURE_CLIENT_ID: kubelet's user-assigned managed identity with
+#     "Storage Blob Data Reader" on the source account
+#   - REPLACE_WITH_NODEPOOL: agent pool with NVMe + IB (e.g. "gb300")
+#   - NUM_NODES (in launcher script) and Worker.replicas — must match
+#   - TRAINING_COMMAND: replace the placeholder with your real workload
+#
+# Submit:
+#   kubectl apply -f mpijob-download-then-train.yaml
+#   kubectl logs -f -l training.kubeflow.org/job-role=launcher
+
+apiVersion: kubeflow.org/v2beta1
+kind: MPIJob
+metadata:
+  name: download-then-train
+spec:
+  slotsPerWorker: 1
+  launcherCreationPolicy: WaitForWorkersReady
+  runPolicy:
+    cleanPodPolicy: Running
+  mpiReplicaSpecs:
+
+    Launcher:
+      replicas: 1
+      template:
+        metadata:
+          labels:
+            app: download-then-train
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: launcher
+              image: REPLACE_WITH_REGISTRY/azcp-train:TAG
+              imagePullPolicy: IfNotPresent
+              env:
+                - name: SOURCE_URL
+                  value: "https://REPLACE_WITH_ACCOUNT.blob.core.windows.net/REPLACE_WITH_CONTAINER/REPLACE_WITH_PREFIX/"
+                - name: AZURE_CLIENT_ID
+                  value: "REPLACE_WITH_KUBELET_CLIENT_ID"
+              command: ["/bin/bash", "-c"]
+              args:
+                - |
+                  set -xeuo pipefail
+                  NUM_NODES=4    # MUST match Worker.replicas below.
+
+                  # Use azcp-cluster's bundled MPI explicitly (not the
+                  # base image's HPC-X or system Open MPI). Keeps stage 1
+                  # ABI-matched to the binary that was tested with it.
+                  export PATH=/opt/azcp/openmpi/bin:$PATH
+                  export LD_LIBRARY_PATH=/opt/azcp/openmpi/lib:/opt/azcp/ucx/lib:${LD_LIBRARY_PATH:-}
+
+                  # Common mpirun args reused by both phases.
+                  MPIRUN_ARGS=(
+                    --allow-run-as-root
+                    -np "$NUM_NODES"
+                    --map-by ppr:1:node
+                    --bind-to none
+                    -hostfile /etc/mpi/hostfile
+                    --prefix /opt/azcp/openmpi
+                    -mca plm_rsh_agent ssh
+                    -mca pml ucx
+                    -mca osc ucx
+                    -mca routed direct
+                    -mca coll_hcoll_enable 0
+                    -x PATH -x LD_LIBRARY_PATH
+                    -x UCX_TLS=rc,sm,self
+                    -x UCX_NET_DEVICES=mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1
+                    -x UCX_IB_GID_INDEX=3
+                  )
+
+                  # ─── Phase 1: download + broadcast ──────────────────
+                  echo "=== Phase 1: azcp-cluster download + broadcast ==="
+                  time mpirun "${MPIRUN_ARGS[@]}" \
+                    -x AZURE_CLIENT_ID -x SOURCE_URL \
+                    azcp-cluster \
+                      "$SOURCE_URL" /mnt/nvme/dataset \
+                      --concurrency 32 --block-size 16777216 \
+                      --bcast-chunk 536870912 --bcast-pipeline 16 \
+                      --compare size \
+                      --no-progress
+
+                  # ─── Phase 2: training / inference ──────────────────
+                  # mpirun is used here purely as a process launcher — NCCL
+                  # (not MPI) handles the actual training collectives. This
+                  # is the pattern that lets `torchrun`-style workloads
+                  # ride inside an MPIJob.
+                  #
+                  # If your workload is MPI-native (Megatron-MPI, Horovod,
+                  # DeepSpeed-MPI), drop the torchrun wrapper and invoke
+                  # your binary directly: `mpirun ... python train.py ...`
+                  echo "=== Phase 2: training ==="
+                  MASTER_ADDR=$(head -1 /etc/mpi/hostfile | awk '{print $1}')
+                  MASTER_PORT=29500
+
+                  time mpirun "${MPIRUN_ARGS[@]}" \
+                    -x MASTER_ADDR="$MASTER_ADDR" \
+                    -x MASTER_PORT="$MASTER_PORT" \
+                    bash -c '
+                      torchrun \
+                        --nnodes='"$NUM_NODES"' \
+                        --node_rank=$OMPI_COMM_WORLD_RANK \
+                        --nproc_per_node=8 \
+                        --master_addr=$MASTER_ADDR \
+                        --master_port=$MASTER_PORT \
+                        /opt/train.py --model-path /mnt/nvme/dataset
+                    '
+              resources:
+                requests: { cpu: 100m, memory: 256Mi }
+          enableServiceLinks: false
+          automountServiceAccountToken: false
+
+    Worker:
+      replicas: 4    # MUST match $NUM_NODES in the launcher script above.
+      template:
+        metadata:
+          labels:
+            app: download-then-train
+        spec:
+          nodeSelector:
+            agentpool: REPLACE_WITH_NODEPOOL
+          tolerations:
+            - operator: Exists
+          # One rank per node — required by azcp-cluster (and assumed by
+          # the torchrun --nproc_per_node=8 / --nnodes=$NUM_NODES split).
+          affinity:
+            podAntiAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchLabels:
+                      app: download-then-train
+                  topologyKey: kubernetes.io/hostname
+          containers:
+            - name: worker
+              image: REPLACE_WITH_REGISTRY/azcp-train:TAG
+              imagePullPolicy: IfNotPresent
+              env:
+                - name: AZURE_CLIENT_ID
+                  value: "REPLACE_WITH_KUBELET_CLIENT_ID"
+              securityContext:
+                # Required for UCX/libibverbs to register memory with the IB
+                # device. Without IPC_LOCK, RDMA fails silently and UCX
+                # falls back to TCP.
+                capabilities:
+                  add: ["IPC_LOCK"]
+              resources:
+                requests:
+                  cpu: "16"
+                  memory: "64Gi"
+                  nvidia.com/gpu: "8"   # for phase 2; phase 1 doesn't use it
+                  rdma/ib: 4
+                limits:
+                  nvidia.com/gpu: "8"
+                  rdma/ib: 4
+              volumeMounts:
+                - { name: nvme, mountPath: /mnt/nvme }
+                - { name: shm,  mountPath: /dev/shm }
+          volumes:
+            - name: nvme
+              hostPath:
+                path: /mnt/nvme
+                type: DirectoryOrCreate
+            # Memory-backed /dev/shm so UCX (phase 1) and NCCL (phase 2)
+            # have somewhere to put intra-node transport buffers. Neither
+            # mpi-operator nor Kubernetes give you this by default.
+            - name: shm
+              emptyDir:
+                medium: Memory
+          enableServiceLinks: false
+          automountServiceAccountToken: false
+
+# ─── Scheduling considerations if you cannot merge the images ────────────
+#
+# Sometimes you genuinely can't put both stages in one image — the consumer
+# is a long-running Deployment, a Ray cluster, a workflow-managed pipeline
+# with many downstream stages, or it's owned by a different team that
+# ships its own image. In those cases you have to run download and
+# consumer as SEPARATE Kubernetes workloads, which means the scheduler is
+# now responsible for two things:
+#
+#   1. Putting the consumer on the SAME nodes the download wrote to.
+#      Kubernetes has no native "pin to the same nodes another workload
+#      ran on" primitive. You either dedicate a nodepool sized exactly
+#      to the job (so there's only one valid placement) and accept that
+#      the pool sits idle between runs, or you label nodes from the
+#      download pods (needs cluster-level RBAC) and have the consumer
+#      nodeSelect that label.
+#
+#   2. Avoiding a "gap window" between the two workloads. Once the
+#      download MPIJob completes, its pods terminate and the GPU/IB
+#      quota it held is released. On a busy cluster, another tenant's
+#      workload can race in and grab those nodes before the consumer is
+#      admitted — and now your consumer queues indefinitely waiting for
+#      nodes it can never get back. Workload-level controllers like
+#      Kueue admit one workload at a time and don't reserve quota for
+#      "the next workload from the same submitter."
+#
+# Real options if you go down this path:
+#   - initContainer + Indexed Job: collapse the two stages back into one
+#     pod (different images allowed): the initContainer runs azcp-cluster,
+#     the main container runs the consumer against the populated
+#     /mnt/nvme. Same-pod = same-node = no pinning. Single Job admission
+#     = no gap window. No new CRDs. The cost is ~80 lines of bash to
+#     hand-roll the MPI bootstrap inside the initContainer. This is the
+#     answer to reach for FIRST when merging images isn't an option —
+#     see examples/aks/init-container-download-then-train.yaml.
+#   - Argo Workflows: capture the download MPIJob's worker node names as
+#     an output parameter, inject them into the consumer's nodeAffinity.
+#     Doesn't fully close the gap window — pair with Kueue priorities.
+#     Useful when the consumer is a multi-stage workflow.
+#   - Volcano: a single Volcano Job CRD with internal task dependencies
+#     and gang scheduling; both stages share one admission. Cleanest
+#     model technically; not in the AKS managed-experience comfort zone.
+#   - JobSet + Kueue: one JobSet wraps both stages (single Kueue
+#     admission); manual node-pinning via shared nodepool exhaustion.
+#     Requires installing JobSet (alpha CRD) on top of Kueue and writing
+#     a manual MPI bootstrap inside an indexed Job (sshd, hostfile,
+#     mpirun by hand) since JobSet wraps batch/v1 Jobs, not MPIJobs.
+#     Largely obsoleted by the initContainer pattern above.
+#
+# All four add YAML; the initContainer pattern adds the least and needs
+# no cluster extension. For most distributed training and fine-tuning the
+# merged-image pattern in this file is still strictly simpler — the
+# consumer image grows by one or two pip-install lines and the entire
+# scheduling problem disappears.

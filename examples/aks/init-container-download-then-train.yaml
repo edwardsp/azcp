@@ -1,0 +1,316 @@
+---
+# Plain Indexed Job: download-then-train without any operator.
+#
+# Pattern: each pod runs azcp-cluster as an initContainer (cooperating with
+# its peers via MPI broadcast over RDMA), and its main container starts only
+# after the broadcast completes — reading the populated cache from the same
+# pod's /mnt/nvme. Because both containers live in the same pod, same-node
+# placement of the consumer is automatic; no node hand-pinning anywhere.
+#
+# Why this exists alongside mpijob-download-then-train.yaml:
+#   - No cluster-wide operator dependency. If you don't already run
+#     mpi-operator (Kubeflow), this is the pure-Kubernetes alternative.
+#   - Phase ordering is a Kubernetes structural primitive (initContainer →
+#     main), not a bash conditional inside a launcher script.
+#   - **Two different images.** The initContainer uses the azcp-cluster
+#     image; the main container uses your existing training image,
+#     unmodified. The MPIJob pattern requires merging both stacks into
+#     one image; this pattern doesn't.
+#
+# Cost vs. MPIJob:
+#   - You hand-roll the MPI bootstrap (sshd + key Secret + hostfile +
+#     mpirun) inside the initContainer instead of letting mpi-operator
+#     provide Launcher/Worker pods with SSH already wired.
+#   - A handful of non-obvious Kubernetes/sshd workarounds documented inline
+#     below. Stick with mpijob-download-then-train.yaml if you can.
+#
+# The initContainer image must contain azcp-cluster + sshd + Open MPI —
+# i.e. the published ghcr.io/edwardsp/azcp/azcp-cluster image is enough
+# as-is. The main container image can be anything that knows how to read
+# /mnt/nvme/dataset.
+#
+# Edit before applying:
+#   - SOURCE_URL: blob prefix to broadcast
+#   - AZURE_CLIENT_ID: kubelet's user-assigned managed identity with
+#     "Storage Blob Data Reader" on the source account
+#   - REPLACE_WITH_NODEPOOL: agent pool with NVMe + IB (e.g. "gb300")
+#   - NUM_NODES (in env) and parallelism/completions — must match
+#   - REPLACE_WITH_REGISTRY/azcp-train:TAG: your merged image
+#   - TRAINING_COMMAND: replace the placeholder in the train container
+#
+# One-time per cluster: create the SSH keypair Secret used by mpirun.
+#   ssh-keygen -t ed25519 -N '' -f /tmp/mpi_key
+#   kubectl create secret generic azcp-mpi-ssh \
+#     --from-file=id_ed25519=/tmp/mpi_key \
+#     --from-file=id_ed25519.pub=/tmp/mpi_key.pub \
+#     --from-file=authorized_keys=/tmp/mpi_key.pub
+#
+# Optional: Kueue gang admission.
+#   This Job is a first-class Kueue workload. To enforce queue-level
+#   admission (all 4 pods admitted together, quota-checked, queued behind
+#   other tenants) instead of pure scheduler-level placement, add the
+#   queue-name label below to the Job's metadata, after creating a
+#   ResourceFlavor + ClusterQueue + LocalQueue covering this nodepool:
+#     metadata:
+#       labels:
+#         kueue.x-k8s.io/queue-name: <your-localqueue>
+#   No other change required. JobSet is not needed.
+#
+# Submit:
+#   kubectl apply -f init-container-download-then-train.yaml
+#   kubectl logs -f -c broadcast -l job-name=azcp-init
+#   kubectl logs -f -c train     -l job-name=azcp-init
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: azcp-init
+spec:
+  clusterIP: None
+  # InitContainers keep the pod NotReady; without this, kube-dns won't
+  # publish per-pod A records and rank 0 can't reach its peers.
+  publishNotReadyAddresses: true
+  selector:
+    job-name: azcp-init
+  ports:
+    - name: ssh
+      port: 2222
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: azcp-init
+spec:
+  parallelism: 4
+  completions: 4
+  completionMode: Indexed
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        job-name: azcp-init
+    spec:
+      subdomain: azcp-init
+      restartPolicy: Never
+      nodeSelector:
+        agentpool: REPLACE_WITH_NODEPOOL
+      affinity:
+        # One pod per node — every node gets an azcp-cluster rank, every
+        # node gets a populated /mnt/nvme cache.
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  job-name: azcp-init
+      volumes:
+        - name: nvme
+          hostPath:
+            path: /mnt/nvme
+            type: DirectoryOrCreate
+        - name: ssh-key
+          secret:
+            secretName: azcp-mpi-ssh
+            defaultMode: 0400
+        - name: ssh-runtime
+          emptyDir: {}
+      initContainers:
+        - name: broadcast
+          image: ghcr.io/edwardsp/azcp/azcp-cluster:vX.Y.Z
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            capabilities:
+              add: ["IPC_LOCK"]
+          env:
+            - name: AZURE_CLIENT_ID
+              value: "REPLACE_WITH_KUBELET_MI_CLIENT_ID"
+            - name: SOURCE_URL
+              value: "https://ACCOUNT.blob.core.windows.net/CONTAINER/PREFIX/"
+            - name: NUM_NODES
+              value: "4"
+            - name: JOBNAME
+              value: "azcp-init"
+            - name: DOMAIN
+              value: "azcp-init.NAMESPACE.svc.cluster.local"
+            - name: RANK
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+          resources:
+            requests:
+              cpu: "16"
+              memory: "64Gi"
+              rdma/ib: "1"
+            limits:
+              rdma/ib: "1"
+          volumeMounts:
+            - name: nvme
+              mountPath: /mnt/nvme
+            - name: ssh-key
+              mountPath: /etc/mpi-ssh
+              readOnly: true
+            - name: ssh-runtime
+              mountPath: /run/sshd
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              echo "[init] rank=${RANK} pod=$(hostname)"
+
+              mkdir -p /root/.ssh
+              cp /etc/mpi-ssh/id_ed25519 /root/.ssh/id_ed25519
+              cp /etc/mpi-ssh/id_ed25519.pub /root/.ssh/id_ed25519.pub
+              cp /etc/mpi-ssh/authorized_keys /root/.ssh/authorized_keys
+              chmod 700 /root/.ssh
+              chmod 600 /root/.ssh/id_ed25519 /root/.ssh/authorized_keys
+              cat > /root/.ssh/config <<EOF
+              Host *
+                Port 2222
+                StrictHostKeyChecking no
+                UserKnownHostsFile /dev/null
+                LogLevel ERROR
+              EOF
+
+              ssh-keygen -A
+              # /run/sshd is an emptyDir; sshd refuses to start unless the
+              # directory is owned by root and not group/world-writable.
+              chmod 755 /run/sshd
+              sed -i \
+                -e 's/^#\?Port .*/Port 2222/' \
+                -e 's/^#\?PermitRootLogin .*/PermitRootLogin yes/' \
+                -e 's/^#\?PasswordAuthentication .*/PasswordAuthentication no/' \
+                /etc/ssh/sshd_config
+              /usr/sbin/sshd -D -p 2222 &
+              SSHD_PID=$!
+
+              if [[ "${RANK}" != "0" ]]; then
+                # Worker: keep sshd alive until rank 0 signals the broadcast
+                # is done. (We can't poll for orted's process lifetime —
+                # cache-hit broadcasts can finish faster than the polling
+                # interval and we'd miss the entire window.)
+                echo "[worker rank=${RANK}] awaiting /tmp/broadcast-done"
+                for i in $(seq 1 600); do
+                  if [ -f /tmp/broadcast-done ]; then
+                    kill ${SSHD_PID} 2>/dev/null || true
+                    exit 0
+                  fi
+                  sleep 1
+                done
+                echo "[worker rank=${RANK}] FAIL: signal timeout" >&2
+                exit 1
+              fi
+
+              # Launcher (rank 0).
+              # Sleep briefly to let kube-dns flush stale endpoint records
+              # from any prior incarnation of this Service. Without this,
+              # `ssh azcp-init-N…` can land on a deleted pod's old IP.
+              sleep 20
+              for i in $(seq 1 $((NUM_NODES - 1))); do
+                host="${JOBNAME}-${i}.${DOMAIN}"
+                echo "[launcher] waiting for ${host}:2222"
+                for attempt in $(seq 1 120); do
+                  if ssh -o ConnectTimeout=2 -p 2222 root@${host} true 2>/dev/null; then
+                    echo "[launcher] ${host} reachable"
+                    break
+                  fi
+                  sleep 2
+                done
+              done
+
+              # Bake every peer's IP into /etc/hosts on every pod, so
+              # mpirun's child ssh and orted's reverse-callback never depend
+              # on headless-service DNS (which can serve stale records and
+              # whose endpoints take time to converge after Service churn).
+              # `hostname -I` (capital) reads from network interfaces
+              # directly — `hostname -i` would consult DNS and could return
+              # the very stale data we're trying to avoid.
+              for i in $(seq 0 $((NUM_NODES - 1))); do
+                host="${JOBNAME}-${i}.${DOMAIN}"
+                short="${JOBNAME}-${i}"
+                if [ "$i" = "0" ]; then
+                  ip=$(hostname -I | awk '{print $1}')
+                else
+                  ip=$(ssh -o ConnectTimeout=5 -p 2222 root@${host} \
+                        'hostname -I' 2>/dev/null | awk '{print $1}')
+                fi
+                if [ -z "$ip" ]; then
+                  echo "FAIL: could not resolve ${host}" >&2
+                  exit 1
+                fi
+                echo "${ip} ${host} ${short}" >> /etc/hosts
+              done
+              for i in $(seq 1 $((NUM_NODES - 1))); do
+                scp -o ConnectTimeout=5 -P 2222 /etc/hosts \
+                  root@${JOBNAME}-${i}.${DOMAIN}:/etc/hosts
+              done
+
+              HOSTFILE=/tmp/hostfile
+              : > ${HOSTFILE}
+              for i in $(seq 0 $((NUM_NODES - 1))); do
+                echo "${JOBNAME}-${i}.${DOMAIN} slots=1" >> ${HOSTFILE}
+              done
+
+              mkdir -p /mnt/nvme/dataset
+              # `orte_keep_fqdn_hostnames 1` is required because the hostfile
+              # contains FQDNs but the pod's `hostname` returns the short
+              # form; without it ORTE thinks it can't route to itself.
+              mpirun \
+                --allow-run-as-root \
+                -np "${NUM_NODES}" \
+                --map-by ppr:1:node \
+                --bind-to none \
+                -hostfile ${HOSTFILE} \
+                --prefix /opt/openmpi \
+                -mca plm_rsh_agent ssh \
+                -mca pml ucx \
+                -mca osc ucx \
+                -mca routed direct \
+                -mca coll_hcoll_enable 0 \
+                -mca orte_keep_fqdn_hostnames 1 \
+                -x PATH \
+                -x LD_LIBRARY_PATH \
+                -x AZURE_CLIENT_ID \
+                -x SOURCE_URL \
+                -x UCX_TLS=rc,sm,self \
+                -x UCX_NET_DEVICES=mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_3:1 \
+                -x UCX_IB_GID_INDEX=3 \
+                azcp-cluster \
+                  "${SOURCE_URL}" /mnt/nvme/dataset \
+                  --concurrency 32 --block-size 16777216 \
+                  --bcast-chunk 268435456 --bcast-pipeline 8 \
+                  --compare size --no-progress
+
+              echo "[launcher] broadcast done; signalling workers"
+              for i in $(seq 1 $((NUM_NODES - 1))); do
+                ssh -o ConnectTimeout=5 -p 2222 root@${JOBNAME}-${i} \
+                  touch /tmp/broadcast-done
+              done
+              kill ${SSHD_PID} 2>/dev/null || true
+      containers:
+        - name: train
+          # REPLACE_WITH_REGISTRY/azcp-train:TAG — your merged image, see
+          # examples/aks/Dockerfile.training. The placeholder below just
+          # validates the cache is populated and exits.
+          image: mcr.microsoft.com/azurelinux/base/core:3.0
+          imagePullPolicy: IfNotPresent
+          resources:
+            requests:
+              cpu: "1"
+              memory: "1Gi"
+          volumeMounts:
+            - name: nvme
+              mountPath: /mnt/nvme
+              readOnly: true
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              echo "=== train pod ${HOSTNAME:-unknown} ==="
+              du -sb /mnt/nvme/dataset
+              find /mnt/nvme/dataset -type f | wc -l
+              # TRAINING_COMMAND: replace this placeholder with your real
+              # workload, e.g.
+              #   torchrun --nnodes ${NUM_NODES} --nproc_per_node 8 \
+              #     --rdzv_backend c10d --rdzv_endpoint ${RDZV_HOST}:29500 \
+              #     train.py --model /mnt/nvme/dataset/...
+              echo "CACHE HIT VERIFIED on ${HOSTNAME:-unknown}"

@@ -1,0 +1,47 @@
+# Add azcp-cluster to YOUR existing training/inference image.
+#
+# Pattern: copy the azcp-cluster binary and its bundled Open MPI + UCX
+# out of the published azcp-cluster image into your own. Adds ~150 MB of
+# files and one apt install. No source rebuild, no Rust toolchain, no
+# pinning to our base OS.
+#
+# Used by mpijob-download-then-train.yaml as the worker image.
+#
+# Build:
+#   docker buildx build --platform linux/amd64,linux/arm64 \
+#     -f examples/aks/Dockerfile.training \
+#     -t <your-registry>/azcp-train:<tag> --push .
+
+ARG AZCP_VERSION=v0.2.1
+
+# Pick whatever training/inference image you already use. Examples:
+#   nvcr.io/nvidia/pytorch:24.10-py3        (NGC PyTorch, has HPC-X)
+#   vllm/vllm-openai:latest                 (vLLM serving)
+#   nvcr.io/nvidia/tensorflow:24.10-tf2-py3 (NGC TensorFlow)
+#   your-org/finetune:1.4                   (your custom image)
+FROM nvcr.io/nvidia/pytorch:24.10-py3
+
+# Pull azcp-cluster + the Open MPI / UCX it was built against, straight
+# out of the published image. They live under /opt/azcp/ to avoid
+# clashing with anything your base image already ships (NGC images have
+# their own HPC-X stack at /opt/hpcx/, for example).
+COPY --from=ghcr.io/edwardsp/azcp/azcp-cluster:${AZCP_VERSION} \
+     /opt/openmpi /opt/azcp/openmpi
+COPY --from=ghcr.io/edwardsp/azcp/azcp-cluster:${AZCP_VERSION} \
+     /opt/ucx /opt/azcp/ucx
+COPY --from=ghcr.io/edwardsp/azcp/azcp-cluster:${AZCP_VERSION} \
+     /usr/local/bin/azcp-cluster /usr/local/bin/azcp-cluster
+COPY --from=ghcr.io/edwardsp/azcp/azcp-cluster:${AZCP_VERSION} \
+     /usr/local/bin/azcp /usr/local/bin/azcp
+
+# mpi-operator's launcher SSHes into workers to start ranks. NGC images
+# ship openssh-client but not server; most other training images don't
+# either. Skip this line if your base image already has sshd.
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        openssh-server \
+    && rm -rf /var/lib/apt/lists/*
+
+# The download-then-train launcher script invokes azcp-cluster's MPI
+# explicitly via /opt/azcp/openmpi/bin/mpirun, so we don't change the
+# default PATH — your training stack keeps using whatever MPI/NCCL it
+# was built with.

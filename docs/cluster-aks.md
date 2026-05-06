@@ -1,11 +1,13 @@
 # `azcp-cluster` on AKS
 
-Two deployment patterns are supported. **MPIJob (mpi-operator) is the
+Three deployment patterns are supported. **MPIJob (mpi-operator) is the
 recommended one** — it matches how every other distributed-training job on
 AKS is launched, the launcher/worker split is explicit, and `mpirun` wiring
-(SSH, host file, allocation) is handled by the operator. The StatefulSet
-pattern is provided as a fallback for clusters without mpi-operator
-installed.
+(SSH, host file, allocation) is handled by the operator. An **initContainer
++ plain Indexed Job** pattern is provided for clusters that don't (and
+can't) install mpi-operator, or for the "download stage and training stage
+must use different images" case. The StatefulSet pattern is the
+last-resort fallback.
 
 ## Pattern A — MPIJob (recommended)
 
@@ -66,7 +68,53 @@ the point, the dataset stays cached for whatever workload reads it next.
 Wipe it manually with `kubectl debug` or a cleanup `DaemonSet` if you need
 to.
 
-## Pattern B — StatefulSet (fallback)
+## Pattern B — initContainer + Indexed Job (pure Kubernetes)
+
+Use this when **either** of these holds:
+
+- mpi-operator is not (and won't be) installed on the cluster, but you
+  also don't want the StatefulSet fallback's "pods stay running forever"
+  semantics.
+- The download stage and the training stage genuinely need to be
+  **different images** (e.g. training is owned by a different team, or
+  the consumer image is so large you'd rather not double its size with
+  the MPI stack). With initContainer + main container in the same pod,
+  each container picks its own image — no merging required.
+
+The shape is a plain `batch/v1.Job` with `completionMode: Indexed`,
+`parallelism: N`, `podAntiAffinity` for one-pod-per-node placement, and a
+headless Service so the launcher rank can SSH to its peers by pod-FQDN.
+Each pod runs `azcp-cluster` as an `initContainer` (cooperating with peers
+via MPI broadcast over RDMA), and only after the broadcast finishes does
+the main container start — reading the populated cache from the same pod's
+`/mnt/nvme`. Kubernetes' init→main ordering gives you the phase sequencing
+for free; same-pod placement gives you cache-locality for free.
+
+A complete example, with the half-dozen non-obvious sshd / kube-dns / MPI
+workarounds documented inline, is in
+[`examples/aks/init-container-download-then-train.yaml`](../examples/aks/init-container-download-then-train.yaml).
+
+Tradeoffs vs MPIJob:
+
+| | MPIJob | initContainer + Indexed Job |
+|---|---|---|
+| Cluster prerequisite | mpi-operator CRD | None (built-in `batch/v1`) |
+| Image requirement | One merged image (azcp + train stack + sshd) | Two separate images allowed |
+| MPI bootstrap | Operator wires sshd / hostfile | You write it (~80 lines of bash) |
+| Phase sequencing | `mpirun phase1 && mpirun phase2` in launcher | initContainer → main (Kubernetes) |
+| Same-node placement of phase 2 | Same MPIJob workers, automatic | Same pod, automatic |
+| Gang admission | Layer Kueue with `kueue.x-k8s.io/queue-name` label | Same — Kueue treats `batch/v1.Job` as a first-class workload |
+| Failure surfacing | `MPIJob.status` | `Job.status` + per-pod logs |
+
+### When to pick initContainer
+
+- You can't (or don't want to) take an mpi-operator dependency.
+- You need the download image and the training image to stay separate.
+- You want `kubectl get jobs` to show your workload, not a custom resource.
+
+For everything else, prefer MPIJob.
+
+## Pattern C — StatefulSet (fallback)
 
 Use this when you can't install mpi-operator (some managed environments
 don't allow new CRDs, or you're doing a one-off proof-of-concept).
