@@ -754,6 +754,7 @@ impl TransferEngine {
         let block_size = self.config.block_size;
         let check_md5 = self.config.check_md5;
         let discard = self.config.discard;
+        let direct = self.config.direct && !discard;
 
         for blob in blobs {
             let relative = blob
@@ -843,10 +844,15 @@ impl TransferEngine {
                         // chunk tasks can write to disjoint offsets concurrently
                         // without a Mutex. Eliminates per-block open/seek/flush
                         // syscalls that were the dominant CPU cost.
+                        let mut opts = std::fs::OpenOptions::new();
+                        opts.write(true);
+                        #[cfg(target_os = "linux")]
+                        if direct {
+                            use std::os::unix::fs::OpenOptionsExt;
+                            opts.custom_flags(libc::O_DIRECT);
+                        }
                         Some(Arc::new(
-                            std::fs::OpenOptions::new()
-                                .write(true)
-                                .open(&local)
+                            opts.open(&local)
                                 .map_err(|e| AzcpError::Transfer(e.to_string()))?,
                         ))
                     };
@@ -880,7 +886,11 @@ impl TransferEngine {
                             let n = data.len() as u64;
                             if let Some(file_c) = file_c {
                                 tokio::task::spawn_blocking(move || {
-                                    pwrite_all(&file_c, &data, offset)
+                                    if direct {
+                                        pwrite_all_direct(&file_c, &data, offset)
+                                    } else {
+                                        pwrite_all(&file_c, &data, offset)
+                                    }
                                 })
                                 .await
                                 .map_err(|e| AzcpError::Transfer(e.to_string()))?
@@ -907,6 +917,20 @@ impl TransferEngine {
                     if let Some(e) = block_err {
                         pb_c.finish_and_clear();
                         return Err(e);
+                    }
+                    // O_DIRECT writes are 4 KiB-aligned; the trailing chunk was
+                    // rounded up. Truncate back to the true blob length before
+                    // any reader (or MD5 check) sees the file.
+                    if direct {
+                        drop(shared_file);
+                        let f = tokio::fs::OpenOptions::new()
+                            .write(true)
+                            .open(&local)
+                            .await
+                            .map_err(|e| AzcpError::Transfer(e.to_string()))?;
+                        f.set_len(file_size)
+                            .await
+                            .map_err(|e| AzcpError::Transfer(e.to_string()))?;
                     }
                     if check_md5 && !discard {
                         if let Err(e) = verify_md5_file(&blob_name, exp.as_deref(), &local).await {
@@ -1161,6 +1185,49 @@ fn pwrite_all(file: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<
     file.write_all_at(buf, offset)
 }
 
+// O_DIRECT requires the buffer pointer, file offset, and write length to all
+// be aligned (typically 4 KiB on Linux ext4/xfs, NVMe). HTTP response bytes are
+// neither aligned nor padded, so we copy each chunk into an aligned scratch
+// buffer rounded up to the next 4 KiB boundary. The trailing junk past the
+// chunk's true length is corrected by an ftruncate after all writes complete.
+#[cfg(target_os = "linux")]
+fn pwrite_all_direct(
+    file: &std::fs::File,
+    buf: &[u8],
+    offset: u64,
+) -> std::io::Result<()> {
+    use std::alloc::{alloc_zeroed, dealloc, Layout};
+    use std::os::unix::fs::FileExt;
+    const ALIGN: usize = 4096;
+    let n = buf.len();
+    let padded = n.div_ceil(ALIGN) * ALIGN;
+    let layout = Layout::from_size_align(padded.max(ALIGN), ALIGN)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let ptr = unsafe { alloc_zeroed(layout) };
+    if ptr.is_null() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::OutOfMemory,
+            "aligned alloc failed",
+        ));
+    }
+    let result = unsafe {
+        std::ptr::copy_nonoverlapping(buf.as_ptr(), ptr, n);
+        let slice = std::slice::from_raw_parts(ptr, padded);
+        file.write_all_at(slice, offset)
+    };
+    unsafe { dealloc(ptr, layout) };
+    result
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pwrite_all_direct(
+    file: &std::fs::File,
+    buf: &[u8],
+    offset: u64,
+) -> std::io::Result<()> {
+    pwrite_all(file, buf, offset)
+}
+
 #[cfg(windows)]
 fn pwrite_all(file: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<()> {
     use std::os::windows::fs::FileExt;
@@ -1182,6 +1249,41 @@ fn pwrite_all(file: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<
 mod tests {
     use super::{apply_shard, read_shardlist};
     use std::io::Write;
+
+    #[cfg(unix)]
+    #[test]
+    fn pwrite_all_direct_round_trips_unaligned_payload() {
+        // Round-trip an unaligned-length payload through pwrite_all_direct
+        // using a regular (non-O_DIRECT) file. Verifies the alignment math
+        // (padding on write, ftruncate to true length) on a backend that
+        // accepts both — we can't open O_DIRECT on /tmp portably.
+        use super::pwrite_all_direct;
+        use std::os::unix::fs::FileExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("payload.bin");
+        let total: usize = 4 * 1024 * 1024 + 1234;
+        let chunk: usize = 4 * 1024 * 1024;
+        let payload: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .unwrap();
+        f.set_len(total as u64).unwrap();
+        for (i, off) in (0..total).step_by(chunk).enumerate() {
+            let end = (off + chunk).min(total);
+            pwrite_all_direct(&f, &payload[off..end], off as u64)
+                .unwrap_or_else(|e| panic!("chunk {i} pwrite_all_direct: {e}"));
+        }
+        f.set_len(total as u64).unwrap();
+        drop(f);
+        let mut got = vec![0u8; total];
+        let r = std::fs::File::open(&path).unwrap();
+        r.read_exact_at(&mut got, 0).unwrap();
+        assert_eq!(got, payload);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), total as u64);
+    }
 
     #[test]
     fn shard_partitions_disjointly() {

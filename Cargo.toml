@@ -32,6 +32,9 @@ md-5 = "0.10"
 pprof = { version = "0.14", features = ["flamegraph"], optional = true }
 mimalloc = { version = "0.1", default-features = false, optional = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 # tikv-jemallocator only compiles on non-MSVC targets (needs cmake + C toolchain).
 # Gated as a target-conditional optional dep so default-on works on linux/darwin
 # and is silently skipped on Windows MSVC builds.

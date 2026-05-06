@@ -45,6 +45,7 @@ pub fn run(args: &Args, my_entries: Vec<BlobItem>, max_bandwidth: Option<u64>) -
         shard: None,
         shardlist: None,
         max_bandwidth_bytes_per_sec: max_bandwidth,
+        direct: false,
     };
 
     let engine = TransferEngine::new(client, config)

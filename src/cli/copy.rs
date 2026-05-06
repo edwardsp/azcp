@@ -49,6 +49,7 @@ pub async fn run_with_shared(
         shard: args.shard,
         shardlist: args.shardlist.clone(),
         max_bandwidth_bytes_per_sec: args.max_bandwidth,
+        direct: args.direct,
     };
 
     match (&source, &dest) {

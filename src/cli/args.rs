@@ -224,6 +224,12 @@ pub struct CopyArgs {
         help = "Cap aggregate throughput across all workers. Accepts bit-rate (e.g. 50Gbps, 200Mbps) or byte-rate (e.g. 1GB/s, 500MiB/s, 100KB/s). Applies to both uploads and downloads."
     )]
     pub max_bandwidth: Option<u64>,
+
+    #[arg(
+        long,
+        help = "Open destination files with O_DIRECT (Linux/macOS), bypassing the page cache. Aligned writes only; trailing tail is corrected with ftruncate. Download-only; ignored on uploads, blob->blob, and Windows. Helps when sustained NVMe write rate is high enough to make page-cache pressure visible (multi-worker downloads on fast NICs)."
+    )]
+    pub direct: bool,
 }
 
 #[derive(Args)]

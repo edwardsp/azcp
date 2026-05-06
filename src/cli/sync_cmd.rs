@@ -57,6 +57,7 @@ fn build_engine(args: &SyncArgs, credential: Credential) -> Result<Arc<TransferE
         shard: args.shard,
         shardlist: None,
         max_bandwidth_bytes_per_sec: None,
+        direct: false,
     };
     Ok(Arc::new(TransferEngine::new(client, config)?))
 }

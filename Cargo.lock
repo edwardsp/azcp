@@ -144,6 +144,7 @@ dependencies = [
  "hmac",
  "humansize",
  "indicatif",
+ "libc",
  "md-5",
  "mimalloc",
  "percent-encoding",
