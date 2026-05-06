@@ -12,14 +12,6 @@ use azcp::engine::TransferSummary;
 use azcp::error::Result;
 use azcp::storage::blob::client::{LatencyStats, RetryStats};
 
-#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
-#[global_allocator]
-static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
-
-#[cfg(all(feature = "mimalloc-allocator", not(feature = "jemalloc")))]
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
 fn main() {
     let cli = Cli::parse();
 

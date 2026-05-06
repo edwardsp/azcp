@@ -19,9 +19,9 @@ three throughput ceilings you hit on real workloads:
 
 The CLI surface is intentionally close to `azcopy` so muscle-memory carries
 over: `azcp copy`, `azcp sync`, `azcp ls`, `azcp rm`, `azcp mk`. The
-internals are different — Rust, single static binary per platform, jemalloc
-by default, deterministic LPT sharding for parallelism that composes
-across processes and nodes.
+internals are different — Rust, single static binary per platform,
+deterministic LPT sharding for parallelism that composes across processes
+and nodes.
 
 ## Features
 
@@ -253,20 +253,6 @@ Notes:
 - **Comment lines** starting with `#` and blank lines are skipped, so you
   can annotate the file freely. `<DIR>` rollup rows from non-recursive
   `azcp ls` output are also skipped automatically.
-
-### Allocator
-
-Releases ship with **jemalloc** as the default global allocator (Linux/macOS — Windows MSVC silently uses the system allocator). Measured +5-7% throughput vs glibc malloc on sustained multi-worker downloads.
-
-To opt out (system malloc only):
-```bash
-cargo build --release --no-default-features
-```
-
-Mimalloc is also available (no measurable improvement over glibc for this workload, but kept as an option):
-```bash
-cargo build --release --no-default-features --features mimalloc-allocator
-```
 
 ### Throttling and retries
 
