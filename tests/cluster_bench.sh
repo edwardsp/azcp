@@ -149,6 +149,7 @@ data:
       azcp-cluster "${SOURCE_URL}" ${DEST} \\
         --concurrency 32 --block-size 16777216 \\
         --bcast-chunk ${chunk} --bcast-pipeline ${pipeline} \\
+        ${BCAST_EXTRA_ARGS:-} \\
         --compare ${COMPARE} \\
         --no-progress
     echo "=== BENCH_DONE ==="
@@ -219,10 +220,14 @@ EOF
 
   local logs
   logs=$(kubectl -n "$NAMESPACE" logs "${name}-0" 2>/dev/null)
-  local download bcast total
+  local download bcast total verify
   download=$(awk '/^\[download\]/{for(i=1;i<=NF;i++)if($i~/^BW=/){print $i}}' <<<"$logs" | sed 's/BW=//' | head -1)
   bcast=$(awk    '/^\[bcast\]/   {for(i=1;i<=NF;i++)if($i~/^BW=/){print $i}}' <<<"$logs" | sed 's/BW=//' | head -1)
   total=$(awk    '/^\[total\]/   {for(i=1;i<=NF;i++)if($i~/^T=/){print $i}}'  <<<"$logs" | sed 's/T=//;s/s$//' | head -1)
+  verify=$(grep '^\[verify\]' <<<"$logs" | head -1 | sed 's/^\[verify\] //')
+  if [[ -n "$verify" ]]; then
+    echo "VERIFY: $verify" >&2
+  fi
   echo "${label}|${chunk}|${pipeline}|${tls}|${rep}|${download:-?}|${bcast:-?}|${total:-?}"
 
   kubectl -n "$NAMESPACE" delete statefulset,service,configmap "$name" "${name}-cfg" --ignore-not-found --wait=false >&2 || true

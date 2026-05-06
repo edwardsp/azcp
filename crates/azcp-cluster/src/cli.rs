@@ -74,6 +74,22 @@ pub struct Args {
     #[arg(long, default_value_t = 1)]
     pub bcast_pipeline: usize,
 
+    /// Number of writer threads on receiver ranks for bcast output.
+    /// Single-threaded buffered writes can bottleneck below NVMe line
+    /// rate; fanning across multiple threads (dispatched by file_id %
+    /// N) restores throughput. Owner ranks are unaffected.
+    #[arg(long, default_value_t = 2)]
+    pub bcast_writers: usize,
+
+    /// Disable O_DIRECT for bcast output files. By default, output files
+    /// are opened with O_DIRECT to bypass the page cache, which on fast
+    /// NVMe lifts single-thread write throughput from ~47 Gb/s to
+    /// ~100 Gb/s. The trailing partial chunk of each file is rounded up
+    /// to alignment and ftruncate'd back at close. Use this flag on
+    /// filesystems that don't support O_DIRECT (NFS, some FUSE mounts).
+    #[arg(long)]
+    pub no_bcast_direct: bool,
+
     /// Maximum retries per HTTP request
     #[arg(long, default_value_t = 5)]
     pub max_retries: u32,
@@ -91,6 +107,13 @@ pub struct Args {
     /// downloaders against one storage account cause 503 throttling.
     #[arg(long, value_name = "K")]
     pub download_ranks: Option<usize>,
+
+    /// After bcast, compute MD5 of every local file on every rank and
+    /// cross-check. Where the blob has a Content-MD5 (typically only
+    /// small single-shot uploads), also verify against that. Mismatch
+    /// is logged and exits non-zero.
+    #[arg(long)]
+    pub verify: bool,
 
     /// Disable per-rank progress bars (default: TTY-aware)
     #[arg(long)]

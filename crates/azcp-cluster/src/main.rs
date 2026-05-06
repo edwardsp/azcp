@@ -232,6 +232,14 @@ fn main() -> ExitCode {
         );
     }
 
+    if args.verify {
+        if let Err(err) = stages::verify::run(&world, &args, &entries) {
+            eprintln!("rank {rank}: verify stage failed: {err:#}");
+            unsafe { ffi::MPI_Abort(world.as_raw(), 7) };
+            return ExitCode::from(7);
+        }
+    }
+
     let t0 = environment::time();
     if rank == 0 {
         if let Some(path) = &args.save_filelist {

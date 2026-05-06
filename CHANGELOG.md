@@ -5,6 +5,65 @@ All notable changes to `azcp` and `azcp-cluster` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.3.0] — 2026-05
+
+Second `azcp-cluster` performance lift, plus an opt-in cryptographic
+integrity check for the broadcast path.
+
+### Added
+
+- **`--bcast-writers N`** (default `2`) on `azcp-cluster`. Fans completed
+  bcast chunks across N writer threads (dispatched by `file_id % N`) on
+  receiver ranks. Owner ranks are unaffected. Lifts the
+  single-thread-buffered-write bottleneck that capped the v0.2.1
+  receive path.
+- **`--bcast-direct`** (default **on**; opt out with `--no-bcast-direct`)
+  on `azcp-cluster`. Opens output files with `O_DIRECT` and uses
+  4 KiB-aligned buffers; the trailing partial chunk of each file is
+  rounded up to alignment for the write and `ftruncate`'d back to its
+  true length at close. Use `--no-bcast-direct` on filesystems that
+  don't support `O_DIRECT` (NFS, some FUSE mounts).
+- **`--verify`** on `azcp-cluster`. After bcast, every rank computes
+  MD5 of every local file (rayon-parallel), `MPI_Allgather`s the
+  digests, and rank 0 cross-checks. Where the source blob has a
+  `Content-MD5` (typically only blobs uploaded as a single block), the
+  digest is also compared against that. Mismatch logs the offending
+  file and aborts with exit 7. Cost on the 16-node / 413 GiB / 524-file
+  reference: ~25-30 s.
+- `BCAST_EXTRA_ARGS` env support in `tests/cluster_bench.sh` so the
+  benchmark harness can sweep the new flags without script edits.
+
+### Performance
+
+- **Multi-writer + O_DIRECT bcast — 3.5× faster end-to-end on NVMe.**
+  On the 16-node GB300 reference cluster (413 GiB / 524 files), per-
+  receiver bcast bandwidth on NVMe with the new defaults
+  (`--bcast-writers 2 --bcast-direct`) rose from **28 Gb/s → 99 Gb/s**
+  and end-to-end wall-clock dropped from **134 s → 48 s**. Updated
+  reference table and tuning options in
+  [docs/cluster-benchmarks.md](docs/cluster-benchmarks.md).
+
+### Documentation
+
+- `docs/cluster-benchmarks.md` rewritten as outline-of-options +
+  measured numbers (drops the v0.2.0/v0.2.1 diagnostic arc, kept in
+  git history).
+- `docs/performance-tuning.md` annotates the bottleneck-progression
+  table with `--discard` so it is clear those numbers are network-only
+  and exclude filesystem write overhead.
+- `README.md` clarifies the credential resolution order: SAS in URL is
+  rank 1 (not workload identity), and the az-cli row notes that Bearer
+  is preferred over scraped SharedKey since accounts with
+  `allowSharedKeyAccess=false` reject the latter with 403.
+
+### Notes
+
+No backwards-incompatible CLI changes. Existing scripts continue to
+work; the only behavioural change is that bcast output now uses
+`O_DIRECT` by default. If your destination filesystem doesn't support
+`O_DIRECT`, add `--no-bcast-direct`. New image:
+`ghcr.io/edwardsp/azcp/azcp-cluster:v0.3.0`.
+
 ## [v0.2.1] — 2026-05
 
 Performance fix in the `azcp-cluster` broadcast receive loop. Same

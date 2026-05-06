@@ -77,12 +77,13 @@ Requires Rust 1.75+.
 
 `azcp` resolves credentials in this order:
 
-1. `AZURE_STORAGE_ACCOUNT` + `AZURE_STORAGE_KEY` — Shared Key
-2. `AZURE_STORAGE_SAS_TOKEN` — SAS
-3. **AKS workload identity** — when `AZURE_FEDERATED_TOKEN_FILE` + `AZURE_CLIENT_ID` + `AZURE_TENANT_ID` are set (automatic in workload-identity-enabled pods)
-4. **Azure VM managed identity** via IMDS (`169.254.169.254`). If multiple user-assigned identities are attached, set `AZURE_CLIENT_ID` to select one.
-5. Ambient Azure CLI login (`az login`) — account key then Bearer token
-6. Anonymous (public containers only)
+1. SAS token embedded in the source/destination URL (`?sv=...&sig=...`)
+2. `AZURE_STORAGE_ACCOUNT` + `AZURE_STORAGE_KEY` — Shared Key
+3. `AZURE_STORAGE_SAS_TOKEN` — SAS
+4. **AKS workload identity** — when `AZURE_FEDERATED_TOKEN_FILE` + `AZURE_CLIENT_ID` + `AZURE_TENANT_ID` are set (automatic in workload-identity-enabled pods)
+5. **Azure VM managed identity** via IMDS (`169.254.169.254`). If multiple user-assigned identities are attached, set `AZURE_CLIENT_ID` to select one.
+6. Ambient Azure CLI login (`az login`) — Bearer token (RBAC) preferred over scraped account key, since accounts that disable `allowSharedKeyAccess` reject the latter with 403.
+7. Anonymous (public containers only)
 
 Run `azcp env` to see which credential source is active.
 
