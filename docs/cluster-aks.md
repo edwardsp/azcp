@@ -57,8 +57,11 @@ for pod in $(kubectl get pods -l training.kubeflow.org/job-role=worker -o name);
 done
 ```
 
-All sizes should be identical and equal to the source. Spot-check a sample
-file's md5 across two pods to be sure the bcast didn't corrupt anything.
+All sizes should be identical and equal to the source. For end-to-end
+content integrity, run the bcast with `--verify`: every rank MD5s its copy
+of every file and MPI-Allgathers the digests, failing the job if any rank
+disagrees. See [`docs/cluster-benchmarks.md`](cluster-benchmarks.md) for
+the cost (~25-30 s on a ~400 GiB dataset).
 
 ### When the job ends
 

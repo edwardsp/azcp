@@ -10,6 +10,26 @@ at line rate, and the recipes for both bare VMs and Kubernetes/AKS.
 This is **single-process / single-node** tuning for plain `azcp`. For
 multi-node broadcast, see [`docs/cluster.md`](cluster.md).
 
+## Current single-node baseline
+
+Before isolating the download path, here is the current end-to-end result on
+a single Azure GB300 ARM node writing to a raided local NVMe at `/mnt/nvme`
+(`--workers 8 --concurrency 32 --parallel-files 4 --block-size 16777216`)
+while downloading a 413 GiB / 524-file checkpoint:
+
+| Mode | Median Gbps | Best Gbps | Wall (median) |
+|---|---|---|---|
+| Buffered | 74.2 | 78.7 | 44.5s |
+| `--direct` | 91.9 | 95.0 | 36.0s |
+
+So on this real single-node GB300 workload, `--direct` improves end-to-end
+throughput by about **24%** by bypassing page-cache write-back on the raided
+NVMe destination.
+
+The rest of this document then strips filesystem writes out of the picture
+with `--discard` and shows how far the **download path itself** can go once
+overlay-network, NUMA, and single-process limits are removed.
+
 ## When you need this
 
 You only need this if:
@@ -185,19 +205,12 @@ go straight from the HTTP response buffer to disk, which avoids the
 write-back churn that competes with new incoming bytes once the page cache
 fills.
 
-Measured on a single GB300 ARM node (NVMe at `/mnt/nvme`, `--workers 8
---concurrency 32 --parallel-files 4 --block-size 16777216`) downloading a
-413 GiB / 524-file checkpoint:
-
-| Mode       | Median Gbps | Best Gbps | Wall (median) |
-|---|---|---|---|
-| Buffered   | 74.2 | 78.7 | 44.5s |
-| `--direct` | 91.9 | 95.0 | 36.0s |
-
-About a **24% throughput uplift** on this workload, with the variance
-band still dominated by Azure storage tail latency (p99 ~1-2s either way).
-Three runs each, no retries, cold page cache between runs (`drop_caches`
-in init). The bench harness lives at `bench/run-direct.sh` (untracked).
+On the GB300 single-node baseline above, that lifts end-to-end throughput
+from **74.2 Gbps** to **91.9 Gbps** on the raided NVMe destination — about a
+**24% uplift** on that workload. The variance band was still dominated by
+Azure storage tail latency (p99 ~1-2s either way). Three runs each, no
+retries, cold page cache between runs (`drop_caches` in init). The bench
+harness lives at `bench/run-direct.sh` (untracked).
 
 Use `--direct` when:
 
@@ -213,8 +226,7 @@ Skip `--direct` when:
   reading the just-downloaded checkpoint benefit from the cached pages).
 - The destination is a network filesystem (NFS / CIFS / Lustre) — those
   layers translate `O_DIRECT` themselves and the semantics get fuzzy.
-- The destination block device doesn't accept 4 KiB-aligned writes (rare;
-  `tmpfs` and overlayfs reject `O_DIRECT` outright with `EINVAL`).
+- The destination block device doesn't accept 4 KiB-aligned writes.
 
 Internally `azcp` writes each block through a 4 KiB-aligned scratch buffer
 (HTTP response bytes are not naturally aligned), pads the final block of
