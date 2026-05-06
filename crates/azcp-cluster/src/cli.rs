@@ -108,6 +108,12 @@ pub struct Args {
     #[arg(long, value_name = "K")]
     pub download_ranks: Option<usize>,
 
+    /// After bcast, compute MD5 of every local file on every rank and
+    /// cross-check. Where the blob has a Content-MD5 (typically only
+    /// small single-shot uploads), also verify against that. Mismatch
+    /// is logged and exits non-zero.
+    #[arg(long)]
+    pub verify: bool,
 
     /// Disable per-rank progress bars (default: TTY-aware)
     #[arg(long)]
