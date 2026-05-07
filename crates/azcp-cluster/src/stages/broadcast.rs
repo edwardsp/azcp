@@ -104,10 +104,12 @@ pub fn run(
     entries: &[BlobItem],
     plan: &[(usize, usize)],
     presence: &Presence,
+    num_rails: usize,
 ) -> Result<()> {
     let rank = world.rank() as usize;
     let chunk: usize = args.bcast_chunk;
-    let depth: usize = args.bcast_pipeline.max(1);
+    let num_rails: usize = num_rails.max(1);
+    let depth: usize = resolve_pipeline_depth(args.bcast_pipeline, num_rails, rank);
     let num_writers: usize = args.bcast_writers.max(1);
     let direct: bool = !args.no_bcast_direct;
 
@@ -116,6 +118,9 @@ pub fn run(
             "--bcast-direct requires --bcast-chunk to be a multiple of {ALIGN} (got {chunk})"
         ));
     }
+
+    let rail_comms: Vec<SimpleCommunicator> =
+        (0..num_rails).map(|_| world.duplicate()).collect();
 
     let mut buffers: Vec<Option<AlignedBuf>> = (0..depth)
         .map(|_| AlignedBuf::new(chunk).map(Some))
@@ -140,7 +145,7 @@ pub fn run(
     drop(ack_tx);
 
     let result = drive_pipeline(
-        world,
+        &rail_comms,
         args,
         entries,
         plan,
@@ -173,12 +178,13 @@ pub fn run(
         }
     }
 
+    drop(rail_comms);
     result.and(writer_result)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn drive_pipeline(
-    world: &SimpleCommunicator,
+    rail_comms: &[SimpleCommunicator],
     args: &Args,
     entries: &[BlobItem],
     plan: &[(usize, usize)],
@@ -192,10 +198,12 @@ fn drive_pipeline(
     cmd_txs: &[mpsc::Sender<WriterCmd>],
     ack_rx: &mpsc::Receiver<WriteAck>,
 ) -> Result<()> {
+    let num_rails = rail_comms.len().max(1);
     let mut files: Vec<Option<FileCtx>> = Vec::with_capacity(plan.len());
     let mut next_file_idx: usize = 0;
     let mut current_file: Option<usize> = None;
     let mut current_broadcaster: i32 = 0;
+    let mut current_rail: usize = 0;
     let mut writes_pending: usize = 0;
 
     // MPI_Ibcast's count argument is a C `int`, so a single call cannot move
@@ -277,6 +285,7 @@ fn drive_pipeline(
                 files.push(Some(ctx));
                 current_file = Some(files.len() - 1);
                 current_broadcaster = broadcaster as i32;
+                current_rail = (files.len() - 1) % num_rails;
             }
 
             let fid = current_file.unwrap();
@@ -312,7 +321,7 @@ fn drive_pipeline(
                         sub as i32,
                         ffi::RSMPI_UINT8_T,
                         current_broadcaster,
-                        world.as_raw(),
+                        rail_comms[current_rail].as_raw(),
                         &mut req,
                     )
                 };
@@ -508,4 +517,50 @@ fn ensure_parent(path: &Path) -> Result<()> {
             .map_err(|e| anyhow!("mkdir -p {}: {e}", parent.display()))?;
     }
     Ok(())
+}
+
+fn resolve_pipeline_depth(user: Option<usize>, num_rails: usize, rank: usize) -> usize {
+    let floor = (2 * num_rails).max(1);
+    match user {
+        None if num_rails > 1 => floor,
+        None => 1,
+        Some(d) => {
+            let d = d.max(1);
+            if num_rails > 1 && d < floor && rank == 0 {
+                eprintln!(
+                    "[bcast] warning: --bcast-pipeline {d} < 2 * --bcast-rails ({num_rails}); \
+                     rails will starve. Consider --bcast-pipeline {floor} or higher."
+                );
+            }
+            d
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_pipeline_depth;
+
+    #[test]
+    fn pipeline_default_single_rail_is_one() {
+        assert_eq!(resolve_pipeline_depth(None, 1, 0), 1);
+    }
+
+    #[test]
+    fn pipeline_default_multi_rail_is_2k() {
+        assert_eq!(resolve_pipeline_depth(None, 4, 0), 8);
+        assert_eq!(resolve_pipeline_depth(None, 8, 0), 16);
+    }
+
+    #[test]
+    fn pipeline_explicit_user_value_wins() {
+        assert_eq!(resolve_pipeline_depth(Some(32), 4, 0), 32);
+        assert_eq!(resolve_pipeline_depth(Some(2), 1, 0), 2);
+    }
+
+    #[test]
+    fn pipeline_zero_clamped_to_one() {
+        assert_eq!(resolve_pipeline_depth(Some(0), 1, 0), 1);
+        assert_eq!(resolve_pipeline_depth(Some(0), 4, 0), 1);
+    }
 }

@@ -70,9 +70,22 @@ pub struct Args {
     /// pipelining and is currently the best default on TCP-only fabrics
     /// where OpenMPI's MPI_Bcast already pipelines internally; raise it
     /// when you have RDMA or multi-rail links where additional
-    /// concurrency actually finds more bandwidth.
-    #[arg(long, default_value_t = 1)]
-    pub bcast_pipeline: usize,
+    /// concurrency actually finds more bandwidth. When unset and
+    /// --bcast-rails > 1, defaults to 2 * rails so every rail stays warm.
+    #[arg(long)]
+    pub bcast_pipeline: Option<usize>,
+
+    /// Enable multi-rail broadcast: dup the world communicator into K
+    /// streams and round-robin file-level Ibcasts across them, while
+    /// telling UCX it may stripe rendezvous transfers across all active
+    /// HCAs (UCX_MAX_RNDV_RAILS / UCX_MAX_EAGER_RAILS / UCX_NET_DEVICES
+    /// are exported pre-MPI_Init). Pass `auto` to use every ACTIVE
+    /// InfiniBand port detected via sysfs, or an explicit integer to
+    /// pin K. Off by default (single-rail behavior preserved).
+    /// Required to break the ~99 Gb/s single-rail ceiling on 4-HCA
+    /// nodes (GB300, ND H100 v5).
+    #[arg(long, value_name = "N|auto")]
+    pub bcast_rails: Option<String>,
 
     /// Number of writer threads on receiver ranks for bcast output.
     /// Single-threaded buffered writes can bottleneck below NVMe line

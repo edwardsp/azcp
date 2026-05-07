@@ -1,6 +1,7 @@
 mod cli;
 mod filelist;
 mod paths;
+mod rails;
 mod stages;
 mod timing;
 
@@ -17,6 +18,15 @@ use cli::{Args, Stage};
 
 fn main() -> ExitCode {
     let args = Args::parse();
+
+    let rail_config = match resolve_rails(args.bcast_rails.as_deref()) {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            eprintln!("[fatal] --bcast-rails: {err}");
+            return ExitCode::from(2);
+        }
+    };
+    apply_rail_env(&rail_config);
 
     let universe = mpi::initialize().expect("MPI_Init failed");
     let world = universe.world();
@@ -52,7 +62,7 @@ fn main() -> ExitCode {
     eprintln!("hello rank {rank}/{size} from {}", hostname());
 
     if rank == 0 {
-        print_transport_diagnostics();
+        print_transport_diagnostics(&rail_config);
     }
 
     if matches!(args.stage, Stage::Init) {
@@ -216,7 +226,14 @@ fn main() -> ExitCode {
     }
 
     let t0 = environment::time();
-    if let Err(err) = stages::broadcast::run(&world, &args, &entries, &bcast_plan, &presence) {
+    if let Err(err) = stages::broadcast::run(
+        &world,
+        &args,
+        &entries,
+        &bcast_plan,
+        &presence,
+        rail_config.count,
+    ) {
         eprintln!("rank {rank}: broadcast stage failed: {err:#}");
         unsafe { ffi::MPI_Abort(world.as_raw(), 6) };
         return ExitCode::from(6);
@@ -277,7 +294,7 @@ fn hostname() -> String {
         .unwrap_or_else(|_| "unknown".to_string())
 }
 
-fn print_transport_diagnostics() {
+fn print_transport_diagnostics(rails: &RailConfig) {
     eprintln!("[transport] env:");
     for var in [
         "OMPI_MCA_pml",
@@ -286,9 +303,21 @@ fn print_transport_diagnostics() {
         "UCX_TLS",
         "UCX_NET_DEVICES",
         "UCX_IB_GID_INDEX",
+        "UCX_MAX_RNDV_RAILS",
+        "UCX_MAX_EAGER_RAILS",
     ] {
         let val = std::env::var(var).unwrap_or_else(|_| "(unset)".to_string());
         eprintln!("[transport]   {var}={val}");
+    }
+
+    if rails.count > 1 {
+        eprintln!(
+            "[transport] multi-rail: K={} devices=[{}]",
+            rails.count,
+            rails.devices.join(",")
+        );
+    } else {
+        eprintln!("[transport] multi-rail: disabled (single rail)");
     }
 
     if let Ok(output) = std::process::Command::new("ompi_info")
@@ -317,5 +346,65 @@ fn print_transport_diagnostics() {
         }
     } else {
         eprintln!("[transport] ucx_info not available");
+    }
+}
+
+struct RailConfig {
+    count: usize,
+    devices: Vec<String>,
+}
+
+fn resolve_rails(spec: Option<&str>) -> Result<RailConfig, String> {
+    let Some(spec) = spec else {
+        return Ok(RailConfig {
+            count: 1,
+            devices: Vec::new(),
+        });
+    };
+    let detected = rails::enumerate_active_ib_hcas()
+        .map_err(|e| format!("scan /sys/class/infiniband: {e}"))?;
+    if detected.is_empty() {
+        return Err(format!(
+            "--bcast-rails {spec}: no ACTIVE InfiniBand ports found in /sys/class/infiniband"
+        ));
+    }
+
+    let want: usize = if spec.eq_ignore_ascii_case("auto") {
+        detected.len()
+    } else {
+        spec.parse::<usize>()
+            .map_err(|_| format!("--bcast-rails: expected integer or 'auto', got {spec:?}"))?
+    };
+    if want == 0 {
+        return Err("--bcast-rails 0 is invalid (use 'auto' or N>=1)".into());
+    }
+    if want > detected.len() {
+        return Err(format!(
+            "--bcast-rails {want}: only {} ACTIVE IB ports detected ({})",
+            detected.len(),
+            detected.join(",")
+        ));
+    }
+    let devices: Vec<String> = detected.into_iter().take(want).collect();
+    Ok(RailConfig {
+        count: want,
+        devices,
+    })
+}
+
+fn apply_rail_env(cfg: &RailConfig) {
+    if cfg.count <= 1 {
+        return;
+    }
+    let n = cfg.count.to_string();
+    set_env_if_unset("UCX_MAX_RNDV_RAILS", &n);
+    set_env_if_unset("UCX_MAX_EAGER_RAILS", &n);
+    let joined = cfg.devices.join(",");
+    set_env_if_unset("UCX_NET_DEVICES", &joined);
+}
+
+fn set_env_if_unset(key: &str, val: &str) {
+    if std::env::var_os(key).is_none() {
+        std::env::set_var(key, val);
     }
 }
