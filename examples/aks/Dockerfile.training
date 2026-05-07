@@ -12,7 +12,7 @@
 #     -f examples/aks/Dockerfile.training \
 #     -t <your-registry>/azcp-train:<tag> --push .
 
-ARG AZCP_VERSION=v0.2.1
+ARG AZCP_VERSION=v0.3.0
 
 # Pick whatever training/inference image you already use. Examples:
 #   nvcr.io/nvidia/pytorch:24.10-py3        (NGC PyTorch, has HPC-X)
