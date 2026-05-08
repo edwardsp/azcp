@@ -24,7 +24,7 @@ the Azure reference deployment for AI/HPC clusters (CycleCloud Workspace
 for Slurm, pyxis/enroot, NDR InfiniBand wiring, NCCL/HPCX baked in). If
 you are reproducing this guide on a different stack, check that the
 NUMA-to-NIC mapping and the IB device names match what's in
-[§5.6](#56-numa-pinning--the-biggest-single-win) before copying the
+[§5.5](#55-numa-pinning--the-biggest-single-win) before copying the
 pinning recipe verbatim.
 
 The workload uses **`MPI_Ibcast`** (non-blocking broadcast) via Open MPI inside a container. One MPI rank per node. This guide is most directly applicable to anything that issues collectives over the same Open MPI / UCX stack on this SKU.
@@ -162,20 +162,7 @@ Single iter each on v0.3.0:
 
 Stable. Confirms ~25% bcast win is reproducible.
 
-### 5.5 Multi-rail attempt (does not stack with linear)
-
-We also tested the same algorithm on a separate image with UCX 1.18 + `--bcast-rails auto` (8 IB devices instead of 1):
-
-| Image | extra | bcast mean (3 iters) |
-|---|---|---:|
-| v0.3.0 (UCX 1.15, single rail) | `libnbc_ibcast_algorithm=1` | **94.93 Gb/s** |
-| UCX 1.18 multirail | `libnbc_ibcast_algorithm=1` + `--bcast-rails auto` | 86.46 Gb/s |
-
-**Multirail does not stack with linear** — and actually slightly hurts. Linear is root-bound; striping the same data across more rails on the receivers does not unblock the root NIC.
-
-This is a generally useful pattern: **once you've identified the bottleneck stage, optimizations that target other stages can be neutral or even hurt because they trade complexity for nothing.** Always re-measure when stacking knobs.
-
-### 5.6 NUMA pinning — the biggest single win
+### 5.5 NUMA pinning — the biggest single win
 
 ND H100 v5 has 2 NUMA nodes. NICs split 4-on-NUMA-0, 4-on-NUMA-1:
 
@@ -271,7 +258,7 @@ srun --mpi=pmix --export=$EXP \
 3. **List available coll components and their priorities** with `ompi_info --param coll all --level 9 | grep priority` so you know which one is actually serving your collective.
 4. **Sweep the *right* knob** with single iters first; only run multi-iter validation on the top 1-2 configurations.
 5. **Always pin to NUMA.** On ND H100 v5 specifically: `taskset -c 0-47` for `mlx5_ib0..3`, `taskset -c 48-95` for `mlx5_ib4..7`. This requires `#SBATCH --exclusive` so the cgroup actually exposes those cores.
-6. **Don't blindly stack optimizations.** Multirail did not help linear `MPI_Ibcast` because root NIC was already saturated. Re-measure after each change.
+6. **Don't blindly stack optimizations.** Optimisations that target a non-bottleneck stage can be neutral or even hurt — they trade complexity for nothing. Re-measure after each change.
 
 ---
 
