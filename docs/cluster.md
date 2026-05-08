@@ -219,6 +219,8 @@ want a cold-cache baseline measurement.
   (primary) and Apptainer (alt).
 - [cluster-benchmarks.md](cluster-benchmarks.md) — measurement methodology
   and reference numbers.
+- [cluster-h100-tuning.md](cluster-h100-tuning.md) — Azure ND H100 v5
+  bring-up notes, hcoll/algorithm/NUMA tuning recipes.
 - [performance-tuning.md](performance-tuning.md) — single-node tuning
   background. Most of it doesn't apply to `azcp-cluster` (which is
   fabric-bound, not host-network-stack-bound), but the NUMA section is

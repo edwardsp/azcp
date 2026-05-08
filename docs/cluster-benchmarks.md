@@ -35,6 +35,10 @@ for portability.
 
 ## Reference results
 
+For ND H100 v5 — different fabric, different defaults, different
+bottleneck — see the dedicated tuning notes in
+[cluster-h100-tuning.md](cluster-h100-tuning.md).
+
 ### Test environment
 
 - **Cluster**: 16 × Azure GB300 nodes, InfiniBand interconnect

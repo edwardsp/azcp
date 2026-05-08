@@ -382,6 +382,9 @@ Two layers of additional throughput live in [`docs/`](docs/):
   - [docs/cluster-benchmarks.md](docs/cluster-benchmarks.md) — measured
     bcast and download bandwidth on a 16-node InfiniBand reference
     cluster.
+  - [docs/cluster-h100-tuning.md](docs/cluster-h100-tuning.md) — Azure
+    ND H100 v5 bring-up notes; hcoll, bcast-algorithm, and NUMA
+    tuning recipes when 73 Gb/s default bcast isn't enough.
 
 ## Configuration
 
