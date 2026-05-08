@@ -1,0 +1,205 @@
+apiVersion: "kubeflow.org/v1"
+kind: PyTorchJob
+metadata:
+  name: azcp-runai-load
+  namespace: default
+spec:
+  runPolicy:
+    cleanPodPolicy: None
+  pytorchReplicaSpecs:
+    Master:
+      replicas: 1
+      restartPolicy: Never
+      template:
+        metadata:
+          annotations:
+            k8s.v1.cni.cncf.io/networks: '[{"name":"sriov-rdma"}]'
+        spec:
+          hostNetwork: true
+          dnsPolicy: ClusterFirstWithHostNet
+          nodeSelector:
+            agentpool: gpunpool
+          tolerations:
+            - key: sku
+              operator: Equal
+              value: gpu
+              effect: NoSchedule
+          containers:
+            - name: pytorch
+              image: ghcr.io/edwardsp/azcp/azcp-runai-adapter:latest
+              imagePullPolicy: IfNotPresent
+              securityContext:
+                capabilities:
+                  add: ["IPC_LOCK", "SYS_RESOURCE"]
+              resources:
+                limits:
+                  nvidia.com/gpu: 1
+                  rdma/ib: 1
+                  memory: 200Gi
+                  cpu: 32
+              env:
+                - name: MODEL_URI
+                  value: "https://REPLACE.blob.core.windows.net/models/llama3-70b/"
+                - name: SHARDLIST
+                  value: "/shared/llama3-70b.shardlist"
+                - name: LOCAL_CACHE
+                  value: "/mnt/nvme/cache"
+                - name: AZURE_CLIENT_ID
+                  value: "REPLACE_WITH_WORKLOAD_IDENTITY_CLIENT_ID"
+                - name: AZURE_FEDERATED_TOKEN_FILE
+                  value: "/var/run/secrets/azure/tokens/azure-identity-token"
+                - name: AZURE_TENANT_ID
+                  value: "REPLACE_WITH_TENANT_ID"
+                - name: NCCL_DEBUG
+                  value: "WARN"
+                - name: NCCL_SOCKET_IFNAME
+                  value: "eth0"
+                - name: NCCL_IB_HCA
+                  value: "mlx5_ib0,mlx5_ib1,mlx5_ib2,mlx5_ib3,mlx5_ib4,mlx5_ib5,mlx5_ib6,mlx5_ib7"
+                - name: NCCL_IB_GID_INDEX
+                  value: "3"
+                - name: UCX_TLS
+                  value: "rc,sm,self"
+              volumeMounts:
+                - name: nvme
+                  mountPath: /mnt/nvme
+                - name: shared
+                  mountPath: /shared
+                  readOnly: true
+                - name: dev-shm
+                  mountPath: /dev/shm
+                - name: azure-identity
+                  mountPath: /var/run/secrets/azure/tokens
+                  readOnly: true
+              args:
+                - "--nproc-per-node=1"
+                - "/opt/runai-adapter/test_load.py"
+                - "--model-uri=$(MODEL_URI)"
+                - "--shardlist=$(SHARDLIST)"
+                - "--local-cache=$(LOCAL_CACHE)"
+                - "--workers=4"
+                - "--concurrency=32"
+                - "--validate"
+          volumes:
+            - name: nvme
+              hostPath:
+                path: /mnt/nvme
+                type: DirectoryOrCreate
+            - name: shared
+              persistentVolumeClaim:
+                claimName: shardlist-pvc
+            - name: dev-shm
+              emptyDir:
+                medium: Memory
+                sizeLimit: 32Gi
+            - name: azure-identity
+              projected:
+                sources:
+                  - serviceAccountToken:
+                      path: azure-identity-token
+                      audience: api://AzureADTokenExchange
+                      expirationSeconds: 3600
+    Worker:
+      replicas: 15
+      restartPolicy: Never
+      template:
+        metadata:
+          annotations:
+            k8s.v1.cni.cncf.io/networks: '[{"name":"sriov-rdma"}]'
+        spec:
+          hostNetwork: true
+          dnsPolicy: ClusterFirstWithHostNet
+          nodeSelector:
+            agentpool: gpunpool
+          tolerations:
+            - key: sku
+              operator: Equal
+              value: gpu
+              effect: NoSchedule
+          containers:
+            - name: pytorch
+              image: ghcr.io/edwardsp/azcp/azcp-runai-adapter:latest
+              imagePullPolicy: IfNotPresent
+              securityContext:
+                capabilities:
+                  add: ["IPC_LOCK", "SYS_RESOURCE"]
+              resources:
+                limits:
+                  nvidia.com/gpu: 1
+                  rdma/ib: 1
+                  memory: 200Gi
+                  cpu: 32
+              env:
+                - name: MODEL_URI
+                  value: "https://REPLACE.blob.core.windows.net/models/llama3-70b/"
+                - name: SHARDLIST
+                  value: "/shared/llama3-70b.shardlist"
+                - name: LOCAL_CACHE
+                  value: "/mnt/nvme/cache"
+                - name: AZURE_CLIENT_ID
+                  value: "REPLACE_WITH_WORKLOAD_IDENTITY_CLIENT_ID"
+                - name: AZURE_FEDERATED_TOKEN_FILE
+                  value: "/var/run/secrets/azure/tokens/azure-identity-token"
+                - name: AZURE_TENANT_ID
+                  value: "REPLACE_WITH_TENANT_ID"
+                - name: NCCL_DEBUG
+                  value: "WARN"
+                - name: NCCL_SOCKET_IFNAME
+                  value: "eth0"
+                - name: NCCL_IB_HCA
+                  value: "mlx5_ib0,mlx5_ib1,mlx5_ib2,mlx5_ib3,mlx5_ib4,mlx5_ib5,mlx5_ib6,mlx5_ib7"
+                - name: NCCL_IB_GID_INDEX
+                  value: "3"
+                - name: UCX_TLS
+                  value: "rc,sm,self"
+              volumeMounts:
+                - name: nvme
+                  mountPath: /mnt/nvme
+                - name: shared
+                  mountPath: /shared
+                  readOnly: true
+                - name: dev-shm
+                  mountPath: /dev/shm
+                - name: azure-identity
+                  mountPath: /var/run/secrets/azure/tokens
+                  readOnly: true
+              args:
+                - "--nproc-per-node=1"
+                - "/opt/runai-adapter/test_load.py"
+                - "--model-uri=$(MODEL_URI)"
+                - "--shardlist=$(SHARDLIST)"
+                - "--local-cache=$(LOCAL_CACHE)"
+                - "--workers=4"
+                - "--concurrency=32"
+                - "--validate"
+          volumes:
+            - name: nvme
+              hostPath:
+                path: /mnt/nvme
+                type: DirectoryOrCreate
+            - name: shared
+              persistentVolumeClaim:
+                claimName: shardlist-pvc
+            - name: dev-shm
+              emptyDir:
+                medium: Memory
+                sizeLimit: 32Gi
+            - name: azure-identity
+              projected:
+                sources:
+                  - serviceAccountToken:
+                      path: azure-identity-token
+                      audience: api://AzureADTokenExchange
+                      expirationSeconds: 3600
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: shardlist-pvc
+  namespace: default
+spec:
+  accessModes: ["ReadOnlyMany"]
+  resources:
+    requests:
+      storage: 100Mi
+  storageClassName: azurefile-csi
