@@ -276,4 +276,4 @@ srun --mpi=pmix --export=$EXP \
 
 ## 10. Reproducibility
 
-All measurements above were collected on a 16-node `Standard_ND96isr_H100_v5` cluster in `eastus`, provisioned via [ai-infrastructure-on-azure](https://github.com/Azure/ai-infrastructure-on-azure), with the model in a Premium Block Blob storage account in `eastus2` accessed via a Private Endpoint over the Azure backbone. Each datapoint is a full end-to-end run with `/nvme/<dest>` cleared between runs. Run-to-run variance (σ) is reported alongside multi-iter means.
+All measurements above were collected on a 16-node `Standard_ND96isr_H100_v5` cluster in `eastus`, provisioned via [ai-infrastructure-on-azure](https://github.com/Azure/ai-infrastructure-on-azure), with the model in a standard (GPv2) Blob Storage account in `eastus2` accessed via a Private Endpoint over the Azure backbone. Each datapoint is a full end-to-end run with `/nvme/<dest>` cleared between runs. Run-to-run variance (σ) is reported alongside multi-iter means.
