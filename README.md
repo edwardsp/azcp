@@ -58,7 +58,7 @@ dlopens UCX/libibverbs at runtime, so a self-contained binary that works
 against arbitrary host MPI/UCX stacks is impractical. Pull from GHCR:
 
 ```
-ghcr.io/edwardsp/azcp/azcp-cluster:v0.2.0
+ghcr.io/edwardsp/azcp/azcp-cluster:v0.3.0
 ```
 
 Multi-arch (`linux/amd64`, `linux/arm64`). See
@@ -432,12 +432,12 @@ Coverage includes: upload+rerun skip behavior, all four `--compare-method` strat
 `.github/workflows/build.yml` builds all six platform targets on every push/PR using native runners (no cross-compilation). `.github/workflows/cluster-image.yml` builds and publishes the multi-arch `azcp-cluster` container to GHCR. Tag a release to publish both:
 
 ```bash
-git tag v0.2.0
-git push origin v0.2.0
+git tag v0.3.0
+git push origin v0.3.0
 ```
 
 Binaries land in the GitHub Release; the container lands at
-`ghcr.io/edwardsp/azcp/azcp-cluster:v0.2.0` and `:latest`.
+`ghcr.io/edwardsp/azcp/azcp-cluster:v0.3.0` and `:latest`.
 
 ## Project layout
 

@@ -17,7 +17,7 @@
 #
 # Required env:
 #   SOURCE_URL          Blob prefix to broadcast (e.g. https://acct.blob.../ctr/prefix/)
-#   IMAGE               Container image (e.g. ghcr.io/edwardsp/azcp/azcp-cluster:v0.2.0)
+#   IMAGE               Container image (e.g. ghcr.io/edwardsp/azcp/azcp-cluster:v0.3.0)
 #   AZURE_CLIENT_ID     Kubelet's user-assigned managed identity client ID
 #   NODEPOOL            Agent pool name (nodeSelector.agentpool)
 #
@@ -32,7 +32,7 @@
 #
 # Usage:
 #   SOURCE_URL=https://...blob.core.windows.net/models/foo/ \
-#   IMAGE=ghcr.io/edwardsp/azcp/azcp-cluster:v0.2.0 \
+#   IMAGE=ghcr.io/edwardsp/azcp/azcp-cluster:v0.3.0 \
 #   AZURE_CLIENT_ID=... \
 #   NODEPOOL=gb300 \
 #     ./tests/cluster_bench.sh > bench-results.md
