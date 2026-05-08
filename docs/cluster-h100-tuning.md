@@ -52,7 +52,7 @@ azcp-cluster <src> <dst> \
 
 ## 3. Methodology
 
-Every measurement is a full end-to-end run with `/nvme/deepseek` cleared at start. We report `[download]`, `[bcast]`, `[total]` from the application's own timing. Repeated as 3-iter validation for shortlisted configurations.
+Every measurement is a full end-to-end run with `/nvme/dataset` cleared at start. We report `[download]`, `[bcast]`, `[total]` from the application's own timing. Repeated as 3-iter validation for shortlisted configurations.
 
 For shape verification of "is the network healthy?", we ran NCCL `all_reduce_perf` (HPCX 2.25.1) at 16 nodes × 8 GPUs (128 ranks):
 
@@ -244,7 +244,7 @@ srun --mpi=pmix --export=$EXP \
      --container-mounts=/dev/infiniband:/dev/infiniband,/nvme:/nvme \
      --container-writable \
      taskset -c 0-47 \
-     azcp-cluster <SOURCE_URL> /nvme/deepseek \
+     azcp-cluster <SOURCE_URL> /nvme/dataset \
        --bcast-chunk 67108864 --bcast-pipeline 128 --bcast-writers 8 \
        --concurrency 32 --block-size 16777216 --no-progress
 ```
