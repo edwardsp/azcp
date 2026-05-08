@@ -12,7 +12,7 @@ The workload starts at **75 Gb/s broadcast / 77 s wall-clock**. With three tunin
 |---|---|
 | **VM SKU** | `Standard_ND96isr_H100_v5` |
 | **Per-node hardware** | 8× H100 80 GB, 8× ConnectX-7 NDR (400 Gb/s each), 96 vCPU split across 2 NUMA nodes, 1.8 TB RAM |
-| **NUMA layout** | NUMA 0 = CPUs 0-47, IB devices `mlx5_ib0..3`. NUMA 1 = CPUs 48-95, IB devices `mlx5_ib4..7` |
+| **NUMA layout** | NUMA 0 = CPUs 0-47, IB devices `mlx5_ib0..3`, **frontend (Azure) NIC**. NUMA 1 = CPUs 48-95, IB devices `mlx5_ib4..7` |
 | **Cluster size** | 16 nodes |
 | **Scheduler** | Slurm (Azure CycleCloud Workspace for Slurm), pyxis + enroot |
 | **Container image** | `ghcr.io/edwardsp/azcp/azcp-cluster:v0.3.0` (Open MPI 4.1.6 + UCX 1.15) |
@@ -202,7 +202,7 @@ srun ... taskset -c 0-47 azcp-cluster ...
 | **mean** | **183.31** | **110.29** | **48.41** |
 | σ | 6.7 | 9.8 | 3.3 |
 
-**Both stages benefit.** The download nearly doubled (102 → 183 Gb/s), and the broadcast climbed another ~15% (95 → 110 Gb/s). The download win is the surprise: it's CPU/memory-locality-bound, not network-bound. With the rank cleanly placed next to the NIC, the Blob HTTP path and the NVMe write path both see lower-latency memory access and avoid cross-socket traffic.
+**Both stages benefit.** The download nearly doubled (102 → 183 Gb/s), and the broadcast climbed another ~15% (95 → 110 Gb/s). The reason both stages benefit from the same `taskset -c 0-47` is that on ND H100 v5 the **frontend (Azure) NIC is also on NUMA 0**, alongside `mlx5_ib0..3`. Pinning the rank to NUMA-0 cores therefore co-locates it with both the frontend NIC (used by the Blob download stage) *and* the IB rail (used by the bcast stage). The Blob HTTP path, the NVMe write path, and the IB sends all run against NUMA-0-local memory and skip the cross-socket UPI hop.
 
 If you are using a non-NUMA-0 device (e.g. `mlx5_ib4` for a second-rank-per-node design), pin to `48-95` instead.
 
