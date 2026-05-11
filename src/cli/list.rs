@@ -35,7 +35,11 @@ async fn list_azure(loc: &BlobLocation, args: &ListArgs) -> Result<()> {
                 println!("  {:<40} {modified}", c.name);
             }
         }
-        println!("\n{} container(s)", containers.len());
+        if args.machine_readable {
+            eprintln!("{} container(s)", containers.len());
+        } else {
+            println!("\n{} container(s)", containers.len());
+        }
     } else {
         let prefix = if loc.path.is_empty() {
             None
@@ -78,12 +82,23 @@ async fn list_azure(loc: &BlobLocation, args: &ListArgs) -> Result<()> {
                 );
             }
         }
-        println!(
-            "\n{} dir(s), {} blob(s), {}",
-            prefixes.len(),
-            blobs.len(),
-            humansize::format_size(total_size, humansize::BINARY)
-        );
+        if args.machine_readable {
+            // Keep stdout strictly TSV so `azcp ls --machine-readable > file`
+            // produces a file usable directly as `--shardlist`.
+            eprintln!(
+                "{} dir(s), {} blob(s), {}",
+                prefixes.len(),
+                blobs.len(),
+                humansize::format_size(total_size, humansize::BINARY)
+            );
+        } else {
+            println!(
+                "\n{} dir(s), {} blob(s), {}",
+                prefixes.len(),
+                blobs.len(),
+                humansize::format_size(total_size, humansize::BINARY)
+            );
+        }
     }
 
     Ok(())
