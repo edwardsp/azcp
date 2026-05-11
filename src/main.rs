@@ -75,8 +75,19 @@ fn main() {
 
 fn run_workers(args: &CopyArgs) -> Result<()> {
     let n = args.workers;
+    // Compose --shard X/N (outer) with --workers W (inner) into W*N total
+    // partitions. Worker i of an outer shard (X, N) owns sub-partition
+    // (X*W + i, N*W). When --shard is absent, outer is (0, 1) and we get
+    // (i, W) — the original per-worker split.
+    let (outer_idx, outer_count) = args.shard.unwrap_or((0, 1));
     if args.shard.is_some() {
-        eprintln!("Warning: --shard ignored when --workers > 1 (workers auto-shard).");
+        eprintln!(
+            "[workers] composing --shard {outer_idx}/{outer_count} with --workers {n} \
+             → {} sub-partitions, this process owns {}..{}",
+            outer_count * n,
+            outer_idx * n,
+            outer_idx * n + n,
+        );
     }
     eprintln!("[workers] spawning {n} independent runtimes");
 
@@ -94,7 +105,7 @@ fn run_workers(args: &CopyArgs) -> Result<()> {
     let handles: Vec<_> = (0..n)
         .map(|i| {
             let mut a = args.clone();
-            a.shard = Some((i, n));
+            a.shard = Some((outer_idx * n + i, outer_count * n));
             a.workers = 1;
             a.max_bandwidth = None;
             let shared = SharedTransfer {
@@ -160,5 +171,41 @@ fn run_workers(args: &CopyArgs) -> Result<()> {
     match first_err {
         Some(e) => Err(e),
         None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    fn compose(outer: Option<(usize, usize)>, workers: usize, i: usize) -> (usize, usize) {
+        let (x, n) = outer.unwrap_or((0, 1));
+        (x * workers + i, n * workers)
+    }
+
+    #[test]
+    fn compose_no_outer_shard() {
+        assert_eq!(compose(None, 4, 0), (0, 4));
+        assert_eq!(compose(None, 4, 3), (3, 4));
+    }
+
+    #[test]
+    fn compose_with_outer_shard() {
+        assert_eq!(compose(Some((2, 4)), 3, 0), (6, 12));
+        assert_eq!(compose(Some((2, 4)), 3, 1), (7, 12));
+        assert_eq!(compose(Some((2, 4)), 3, 2), (8, 12));
+    }
+
+    #[test]
+    fn compose_partitions_are_unique_and_complete() {
+        let n = 4;
+        let workers = 3;
+        let mut seen = std::collections::BTreeSet::new();
+        for x in 0..n {
+            for i in 0..workers {
+                let (idx, count) = compose(Some((x, n)), workers, i);
+                assert_eq!(count, n * workers);
+                assert!(seen.insert(idx), "duplicate partition {idx}");
+            }
+        }
+        assert_eq!(seen, (0..n * workers).collect());
     }
 }

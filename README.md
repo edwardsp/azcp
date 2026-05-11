@@ -183,13 +183,12 @@ wait
 | Cross-host scaling | No (single process) | Yes (one process per node) |
 | NUMA pinning | One process can only pin to one NUMA | Each process pins independently |
 
-The two flags **do not compose**: passing `--shard` alongside `--workers > 1`
-prints a warning and the outer `--shard` is ignored (workers do their own
-internal LPT split, so the user-supplied shard would conflict). For
-multi-node deployments, run one process per node with `--shard $NODE/$NODES`
-and leave `--workers` at 1, or scale `--workers` within each node and
-partition across nodes by some other means (e.g. different prefixes per
-node).
+The two flags **compose**: passing `--shard X/N` alongside `--workers W`
+splits this process's outer slice into `W` sub-partitions, so the cluster
+as a whole runs `N × W` total partitions. Each worker `i` of process `X`
+owns sub-partition `(X*W + i) / (N*W)`. This is the right behavior for
+distributed launchers (MPI, torchrun, Slurm) that pass `--shard
+$RANK/$WORLD_SIZE` and want intra-rank parallelism on top.
 
 For the **same dataset on every node** (model checkpoints, training data),
 prefer [`azcp-cluster`](docs/cluster.md) over per-node `--shard` — it pays
