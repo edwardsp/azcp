@@ -6,6 +6,7 @@ use azcp::{parse_location, BlobClient, BlobItem, Credential, Location};
 
 use crate::cli::Args;
 use crate::filelist;
+use crate::paths::is_directory_marker;
 
 const ROOT_RANK: i32 = 0;
 
@@ -33,7 +34,19 @@ pub fn run(world: &SimpleCommunicator, args: &Args) -> Result<Vec<BlobItem>> {
 
     let text =
         std::str::from_utf8(&buf).context("filelist payload from rank 0 is not valid UTF-8")?;
-    Ok(filelist::deserialize(text))
+    let entries = filelist::deserialize(text);
+    let before = entries.len();
+    let entries: Vec<BlobItem> = entries
+        .into_iter()
+        .filter(|e| !is_directory_marker(&args.source, &e.name))
+        .collect();
+    let skipped = before - entries.len();
+    if skipped > 0 && rank == ROOT_RANK {
+        eprintln!(
+            "[list] skipped {skipped} directory-marker blob(s) (name == source prefix or ends in '/')"
+        );
+    }
+    Ok(entries)
 }
 
 fn produce_entries(args: &Args) -> Result<Vec<BlobItem>> {

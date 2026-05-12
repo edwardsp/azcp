@@ -16,6 +16,17 @@ pub fn local_rel(source: &str, name: &str) -> String {
     stripped.trim_start_matches('/').to_string()
 }
 
+/// True for "directory-marker" blobs: names that map to an empty relative path
+/// (the blob's name equals the source prefix) or end in `/`. Creating these as
+/// files would EISDIR against the dest directory itself; they carry no payload
+/// for any stage to act on, so the cluster pipeline filters them out at LIST.
+pub fn is_directory_marker(source: &str, name: &str) -> bool {
+    if name.ends_with('/') {
+        return true;
+    }
+    local_rel(source, name).is_empty()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -47,5 +58,18 @@ mod tests {
     fn local_source_yields_raw_trimmed_name() {
         assert_eq!(local_rel("/some/local/path", "a/b.bin"), "a/b.bin");
         assert_eq!(local_rel("/some/local/path", "/a/b.bin"), "a/b.bin");
+    }
+
+    #[test]
+    fn directory_marker_detection() {
+        let s = "https://acct.blob.core.windows.net/ctr/models/llama/";
+        assert!(is_directory_marker(s, "models/llama/"));
+        assert!(is_directory_marker(s, "models/llama/sub/"));
+        assert!(!is_directory_marker(s, "models/llama/file.bin"));
+        assert!(!is_directory_marker(s, "models/llama"));
+        assert!(!is_directory_marker(
+            "https://acct.blob.core.windows.net/ctr/",
+            "file.bin"
+        ));
     }
 }
