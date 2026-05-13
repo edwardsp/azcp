@@ -5,6 +5,53 @@ All notable changes to `azcp` and `azcp-cluster` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.3.1] — 2026-05
+
+Three independent correctness fixes shaken out by a 16× ND_H100_v5
+shakedown. No new features; users of v0.3.0 in distributed launchers
+or with `--bcast-chunk` ≥ 2 GiB should upgrade.
+
+### Fixed
+
+#### `azcp` (single-node)
+
+- **`--workers` no longer overrides a user-supplied `--shard`.** Previously,
+  passing `--shard X/N` alongside `--workers W>1` silently dropped the
+  outer shard and split only across the W workers, so every rank in a
+  distributed launcher (MPI, torchrun, Slurm) downloaded the full file
+  set instead of its `1/N` slice. The two flags now compose: worker `i`
+  of process `X` owns sub-partition `(X*W + i)/(N*W)`, giving `N*W` total
+  partitions across the cluster.
+
+#### `azcp-cluster`
+
+- **Skip directory-marker blobs in the LIST stage.** Zero-byte blobs whose
+  name equals the source prefix (or ends in `/`) — created by Storage
+  Explorer or `azcopy mkdir`-style tools as directory placeholders —
+  mapped to an empty local-relative path. The broadcast receiver then
+  tried to `OpenOptions::create` the destination directory itself,
+  failing with `EISDIR (os error 21)` and aborting the job. These entries
+  are now filtered once at LIST so all stages agree.
+- **Sub-chunk `MPI_Ibcast` to avoid `int` count overflow.** The single
+  call site cast `n as i32` silently aliased per-chunk byte counts ≥ 2 GiB:
+  - `--bcast-chunk 2 GiB` → `i32::MIN` → MPI fatal abort.
+  - `--bcast-chunk 4 GiB` → `0` → no-op `MPI_Ibcast` returns success but
+    moves zero bytes; receivers commit uninitialized buffer contents to
+    disk with no error or log warning.
+  - `--bcast-chunk 8 GiB` → same no-op + page-fault thrash from the
+    1 TiB combined buffer allocation.
+
+  Each logical pipeline chunk is now split into ≤ 1 GiB `MPI_Ibcast`s and
+  the buffer slot is only released / written once all of its sub-bcasts
+  complete (out-of-order safe via `MPI_Waitany`). User-facing
+  `--bcast-chunk` semantics are unchanged.
+
+#### `azcp ls`
+
+- `--machine-readable` summary footer now goes to stderr so the TSV output
+  on stdout can be piped directly into `azcp copy --shardlist -` without
+  a trailing junk line.
+
 ## [v0.3.0] — 2026-05
 
 Second `azcp-cluster` performance lift (multi-writer + O_DIRECT bcast,
