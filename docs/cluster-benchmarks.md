@@ -49,7 +49,7 @@ bottleneck — see the dedicated tuning notes in
 - **Destination**: per-node NVMe at `/mnt/nvme/dataset` (4-way RAID-0 of
   `Microsoft NVMe Direct Disk v2`, ext4, `noatime,discard,stripe=512`).
   `tmpfs` rows use `emptyDir: {medium: Memory}` with 720 GiB pod limit.
-- **Software**: `azcp-cluster` ≥ v0.3.0 container, Open MPI 4.x + UCX
+- **Software**: `azcp-cluster` ≥ v0.3.1 container, Open MPI 4.x + UCX
   bundled. Run via StatefulSet on AKS with `hostNetwork: true`,
   `IPC_LOCK`, `rdma/ib: 4`.
 - **mpirun env (RDMA)**:
@@ -124,7 +124,7 @@ Example (the row-2 default above):
 
 ```bash
 SOURCE_URL='https://acct.blob.core.windows.net/models/llama/' \
-IMAGE='ghcr.io/edwardsp/azcp/azcp-cluster:v0.3.0' \
+IMAGE='ghcr.io/edwardsp/azcp/azcp-cluster:v0.3.1' \
 AZURE_CLIENT_ID='<workload-identity-client-id>' \
 NODEPOOL=gb300 REPLICAS=16 REPS=3 \
 CONFIGS='rdma-512m-pipe16;536870912;16;rc,sm,self' \

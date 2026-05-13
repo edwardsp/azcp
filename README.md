@@ -58,7 +58,7 @@ dlopens UCX/libibverbs at runtime, so a self-contained binary that works
 against arbitrary host MPI/UCX stacks is impractical. Pull from GHCR:
 
 ```
-ghcr.io/edwardsp/azcp/azcp-cluster:v0.3.0
+ghcr.io/edwardsp/azcp/azcp-cluster:v0.3.1
 ```
 
 Multi-arch (`linux/amd64`, `linux/arm64`). See
@@ -436,7 +436,7 @@ git push origin v0.3.0
 ```
 
 Binaries land in the GitHub Release; the container lands at
-`ghcr.io/edwardsp/azcp/azcp-cluster:v0.3.0` and `:latest`.
+`ghcr.io/edwardsp/azcp/azcp-cluster:v0.3.1` and `:latest`.
 
 ## Project layout
 

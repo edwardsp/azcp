@@ -15,7 +15,7 @@ The workload starts at **75 Gb/s broadcast / 77 s wall-clock**. With three tunin
 | **NUMA layout** | NUMA 0 = CPUs 0-47, IB devices `mlx5_ib0..3`, **frontend (Azure) NIC**. NUMA 1 = CPUs 48-95, IB devices `mlx5_ib4..7` |
 | **Cluster size** | 16 nodes |
 | **Scheduler** | Slurm (Azure CycleCloud Workspace for Slurm), pyxis + enroot |
-| **Container image** | `ghcr.io/edwardsp/azcp/azcp-cluster:v0.3.0` (Open MPI 4.1.6 + UCX 1.15) |
+| **Container image** | `ghcr.io/edwardsp/azcp/azcp-cluster:v0.3.1` (Open MPI 4.1.6 + UCX 1.15) |
 | **Region / fabric** | `eastus`, NDR InfiniBand |
 
 The cluster used for these measurements was provisioned with
