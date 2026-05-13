@@ -198,6 +198,17 @@ fn drive_pipeline(
     let mut current_broadcaster: i32 = 0;
     let mut writes_pending: usize = 0;
 
+    // MPI_Ibcast's count argument is a C `int`, so a single call cannot move
+    // more than i32::MAX bytes. We sub-chunk each logical pipeline chunk
+    // into ≤ MAX_SUB_BCAST byte sub-bcasts and only release / write a slot
+    // once all of its sub-requests have completed (out-of-order safe).
+    // Without this, --bcast-chunk == 2 GiB casts to i32::MIN and aborts
+    // (negative count); --bcast-chunk == 4 GiB / 8 GiB casts to 0 and
+    // silently broadcasts nothing while the writer commits stale buffer
+    // contents to disk.
+    const MAX_SUB_BCAST: usize = 1 << 30; // 1 GiB; comfortably below i32::MAX
+    let mut slot_subs_remaining: Vec<usize> = vec![0; buffers.len()];
+
     loop {
         while !free_slots.is_empty() {
             if current_file.is_none() {
@@ -291,27 +302,34 @@ fn drive_pipeline(
             }
 
             let mut req: ffi::MPI_Request = unsafe { std::mem::zeroed() };
-            let rc = unsafe {
-                ffi::MPI_Ibcast(
-                    buf.as_mut_ptr() as *mut std::ffi::c_void,
-                    n as i32,
-                    ffi::RSMPI_UINT8_T,
-                    current_broadcaster,
-                    world.as_raw(),
-                    &mut req,
-                )
-            };
-            if rc != ffi::MPI_SUCCESS as i32 {
-                return Err(anyhow!("MPI_Ibcast failed with code {rc}"));
+            let buf_ptr = buf.as_mut_ptr();
+            let mut sub_offset: usize = 0;
+            while sub_offset < n {
+                let sub = (n - sub_offset).min(MAX_SUB_BCAST);
+                let rc = unsafe {
+                    ffi::MPI_Ibcast(
+                        buf_ptr.add(sub_offset) as *mut std::ffi::c_void,
+                        sub as i32,
+                        ffi::RSMPI_UINT8_T,
+                        current_broadcaster,
+                        world.as_raw(),
+                        &mut req,
+                    )
+                };
+                if rc != ffi::MPI_SUCCESS as i32 {
+                    return Err(anyhow!("MPI_Ibcast failed with code {rc}"));
+                }
+                in_flight.push(InFlight {
+                    request: req,
+                    slot,
+                    file_id: fid,
+                    n,
+                    offset,
+                });
+                slot_subs_remaining[slot] += 1;
+                sub_offset += sub;
             }
 
-            in_flight.push(InFlight {
-                request: req,
-                slot,
-                file_id: fid,
-                n,
-                offset,
-            });
             ctx.chunks_in_flight += 1;
             ctx.remaining_to_post -= n as u64;
             ctx.next_post_offset += n as u64;
@@ -370,6 +388,12 @@ fn drive_pipeline(
         }
 
         let done = in_flight.swap_remove(completed_idx as usize);
+        slot_subs_remaining[done.slot] -= 1;
+        if slot_subs_remaining[done.slot] > 0 {
+            // Sub-bcast completed but more sub-chunks of this slot are still
+            // outstanding. Don't release/write the buffer yet.
+            continue;
+        }
         let ctx = files[done.file_id].as_mut().unwrap();
         ctx.chunks_in_flight -= 1;
 
