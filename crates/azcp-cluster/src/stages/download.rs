@@ -1,16 +1,15 @@
-use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 
 use azcp::{
-    parse_location, BlobClient, BlobItem, Credential, Location, TransferConfig, TransferEngine,
+    parse_location, BlobClient, Credential, DownloadRange, Location, TransferConfig, TransferEngine,
 };
 
 use crate::cli::Args;
 
-pub fn run(args: &Args, my_entries: Vec<BlobItem>, max_bandwidth: Option<u64>) -> Result<()> {
-    if my_entries.is_empty() {
+pub fn run(args: &Args, my_ranges: Vec<DownloadRange>, max_bandwidth: Option<u64>) -> Result<()> {
+    if my_ranges.is_empty() {
         return Ok(());
     }
     let loc = parse_location(&args.source)
@@ -57,15 +56,8 @@ pub fn run(args: &Args, my_entries: Vec<BlobItem>, max_bandwidth: Option<u64>) -
         .build()
         .context("failed to build tokio runtime for download")?;
 
-    let dest: &Path = args.dest.as_path();
     let summary = rt
-        .block_on(engine.download_entries(
-            my_entries,
-            &blob.account,
-            &blob.container,
-            &blob.path,
-            dest,
-        ))
+        .block_on(engine.download_ranges(my_ranges, &blob.account, &blob.container))
         .map_err(|e| anyhow!("download failed: {e}"))?;
 
     if summary.failed > 0 {

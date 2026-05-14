@@ -37,6 +37,25 @@ fn file_size(item: &BlobItem) -> u64 {
         .unwrap_or(0)
 }
 
+/// Derive `shard_size` from `--file-shards N`: split the largest file
+/// into roughly `N` pieces, rounded up to a multiple of `bcast_chunk`
+/// so the O_DIRECT alignment invariant holds. Returns 0 if `entries`
+/// is empty or the largest file is 0 bytes (no sharding makes sense).
+pub fn compute_shard_size_from_file_shards(
+    entries: &[BlobItem],
+    file_shards: usize,
+    bcast_chunk: u64,
+) -> u64 {
+    assert!(file_shards >= 1, "file_shards must be >= 1");
+    assert!(bcast_chunk > 0, "bcast_chunk must be > 0");
+    let max_size = entries.iter().map(file_size).max().unwrap_or(0);
+    if max_size == 0 {
+        return 0;
+    }
+    let raw = max_size.div_ceil(file_shards as u64);
+    raw.div_ceil(bcast_chunk) * bcast_chunk
+}
+
 fn shards_per_file(size: u64, shard_size: u64) -> usize {
     if shard_size == 0 || size <= shard_size {
         1
@@ -264,5 +283,37 @@ mod tests {
         let from_shards: Vec<usize> = shards.iter().map(|s| s.owner_rank).collect();
         let from_legacy = crate::stages::owners::compute(&entries, count);
         assert_eq!(from_shards, from_legacy);
+    }
+
+    #[test]
+    fn shard_size_from_file_shards_basic() {
+        let entries = vec![item("small", 1024), item("big", 10 * 1024 * 1024 * 1024)];
+        let chunk = 64u64 * 1024 * 1024;
+        let s = compute_shard_size_from_file_shards(&entries, 4, chunk);
+        assert_eq!(s % chunk, 0, "must be chunk-aligned");
+        assert!(s >= (10u64 * 1024 * 1024 * 1024).div_ceil(4));
+        assert!(s < (10u64 * 1024 * 1024 * 1024).div_ceil(4) + chunk);
+    }
+
+    #[test]
+    fn shard_size_from_file_shards_empty_is_zero() {
+        assert_eq!(compute_shard_size_from_file_shards(&[], 4, 1 << 26), 0);
+    }
+
+    #[test]
+    fn shard_size_from_file_shards_zero_byte_max_is_zero() {
+        let entries = vec![item("z", 0), item("z2", 0)];
+        assert_eq!(
+            compute_shard_size_from_file_shards(&entries, 4, 1 << 26),
+            0
+        );
+    }
+
+    #[test]
+    fn shard_size_from_file_shards_alignment() {
+        let entries = vec![item("a", 100 * 1024 * 1024 + 1)];
+        let chunk = 64u64 * 1024 * 1024;
+        let s = compute_shard_size_from_file_shards(&entries, 1, chunk);
+        assert_eq!(s, 128 * 1024 * 1024);
     }
 }

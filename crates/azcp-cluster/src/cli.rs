@@ -123,4 +123,189 @@ pub struct Args {
     /// QA scenarios.
     #[arg(long, value_enum, default_value_t = Stage::All, hide = true)]
     pub stage: Stage,
+
+    /// Range-shard each file into byte chunks of this size before
+    /// distributing across ranks. 0 (default) = no sharding (one shard
+    /// per file, identical to v0.3.1 plan shape). When >0, must be a
+    /// multiple of --bcast-chunk so per-shard O_DIRECT padding never
+    /// straddles shard boundaries. Accepts byte sizes with units:
+    /// 32GiB, 1GB, 16777216. Mutually exclusive with --file-shards.
+    #[arg(long, default_value_t = 0, value_parser = parse_size)]
+    pub shard_size: u64,
+
+    /// Convenience knob: derive --shard-size as
+    /// `ceil(max_file_size / N)` rounded up to a multiple of
+    /// --bcast-chunk. Mutually exclusive with --shard-size.
+    #[arg(long, value_name = "N")]
+    pub file_shards: Option<usize>,
+}
+
+/// Parse a byte size with optional binary/decimal SI suffix.
+/// Accepts: bare bytes (`16777216`), decimal (`32MB`, `1GB`, `2TB`),
+/// binary (`32MiB`, `1GiB`, `2TiB`). Case-insensitive. The trailing
+/// `B` is optional (`32Gi`, `32G` both work as binary GiB / decimal GB
+/// respectively — same convention as `dd`).
+pub fn parse_size(s: &str) -> Result<u64, String> {
+    let raw = s.trim();
+    if raw.is_empty() {
+        return Err("empty size value".into());
+    }
+    let lower = raw.to_lowercase();
+    let split = lower
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(lower.len());
+    let (num_str, unit) = lower.split_at(split);
+    if num_str.is_empty() {
+        return Err(format!(
+            "size must start with a number, got {s:?} (try e.g. 32GiB, 1GB, 16777216)"
+        ));
+    }
+    let num: f64 = num_str
+        .parse()
+        .map_err(|_| format!("bad size number {num_str:?} in {s:?}"))?;
+    if num < 0.0 || !num.is_finite() {
+        return Err(format!("size must be non-negative and finite, got {s:?}"));
+    }
+    let multiplier: f64 = match unit.trim() {
+        "" | "b" | "byte" | "bytes" => 1.0,
+        "k" | "kb" => 1_000.0,
+        "m" | "mb" => 1_000_000.0,
+        "g" | "gb" => 1_000_000_000.0,
+        "t" | "tb" => 1_000_000_000_000.0,
+        "ki" | "kib" => 1024.0,
+        "mi" | "mib" => 1024.0 * 1024.0,
+        "gi" | "gib" => 1024.0 * 1024.0 * 1024.0,
+        "ti" | "tib" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        other => {
+            return Err(format!(
+                "unknown size unit {other:?} in {s:?} (try GiB, MiB, GB, MB)"
+            ))
+        }
+    };
+    Ok((num * multiplier).round() as u64)
+}
+
+impl Args {
+    /// Validate cross-argument invariants that clap can't express
+    /// declaratively. Call once after `Args::parse()`.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.shard_size > 0 && self.file_shards.is_some() {
+            return Err(
+                "--shard-size and --file-shards are mutually exclusive; pass at most one".into(),
+            );
+        }
+        if self.shard_size > 0 {
+            let chunk = self.bcast_chunk as u64;
+            if chunk == 0 {
+                return Err("--bcast-chunk must be > 0".into());
+            }
+            if self.shard_size % chunk != 0 {
+                return Err(format!(
+                    "--shard-size ({}) must be a multiple of --bcast-chunk ({}) so per-shard \
+                     O_DIRECT padding never straddles shard boundaries",
+                    self.shard_size, chunk
+                ));
+            }
+        }
+        if let Some(n) = self.file_shards {
+            if n == 0 {
+                return Err("--file-shards must be >= 1".into());
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_size_units() {
+        assert_eq!(parse_size("0").unwrap(), 0);
+        assert_eq!(parse_size("16777216").unwrap(), 16 * 1024 * 1024);
+        assert_eq!(parse_size("32GiB").unwrap(), 32u64 * 1024 * 1024 * 1024);
+        assert_eq!(parse_size("32gib").unwrap(), 32u64 * 1024 * 1024 * 1024);
+        assert_eq!(parse_size("32Gi").unwrap(), 32u64 * 1024 * 1024 * 1024);
+        assert_eq!(parse_size("1GB").unwrap(), 1_000_000_000);
+        assert_eq!(parse_size("1G").unwrap(), 1_000_000_000);
+        assert_eq!(parse_size("2TiB").unwrap(), 2u64 * 1024 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parse_size_rejects_garbage() {
+        assert!(parse_size("").is_err());
+        assert!(parse_size("abc").is_err());
+        assert!(parse_size("12XYZ").is_err());
+        assert!(parse_size("-5").is_err());
+    }
+
+    fn args_with(shard_size: u64, file_shards: Option<usize>, bcast_chunk: usize) -> Args {
+        Args {
+            source: String::new(),
+            dest: PathBuf::new(),
+            shardlist: None,
+            compare: Compare::None,
+            filelist: None,
+            save_filelist: None,
+            concurrency: 64,
+            block_size: 16 * 1024 * 1024,
+            parallel_files: 16,
+            bcast_chunk,
+            bcast_pipeline: 1,
+            bcast_writers: 2,
+            no_bcast_direct: false,
+            max_retries: 5,
+            max_bandwidth: None,
+            download_ranks: None,
+            verify: false,
+            no_progress: false,
+            stage: Stage::All,
+            shard_size,
+            file_shards,
+        }
+    }
+
+    #[test]
+    fn validate_default_off() {
+        assert!(args_with(0, None, 64 * 1024 * 1024).validate().is_ok());
+    }
+
+    #[test]
+    fn validate_mutex_rejected() {
+        let err = args_with(1 << 30, Some(8), 64 * 1024 * 1024)
+            .validate()
+            .unwrap_err();
+        assert!(err.contains("mutually exclusive"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_shard_must_be_chunk_multiple() {
+        let err = args_with(1_000_000, None, 64 * 1024 * 1024)
+            .validate()
+            .unwrap_err();
+        assert!(err.contains("multiple"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_shard_aligned_ok() {
+        assert!(
+            args_with(64 * 1024 * 1024, None, 64 * 1024 * 1024)
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            args_with(2u64 * 1024 * 1024 * 1024, None, 64 * 1024 * 1024)
+                .validate()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_file_shards_zero_rejected() {
+        let err = args_with(0, Some(0), 64 * 1024 * 1024)
+            .validate()
+            .unwrap_err();
+        assert!(err.contains(">= 1"), "got: {err}");
+    }
 }

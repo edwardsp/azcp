@@ -3,7 +3,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::sync::mpsc::{self, TryRecvError};
 use std::thread;
@@ -57,49 +57,57 @@ impl Drop for AlignedBuf {
     }
 }
 
-struct FileCtx {
-    reader: Option<File>,
-    remaining_to_post: u64,
-    next_post_offset: u64,
-    chunks_in_flight: usize,
-    is_owner: bool,
-    needs_write: bool,
-    path: PathBuf,
-    /// File-absolute byte offset at which this shard begins. The writer
-    /// receives `byte_offset + offset_within_shard` so pwrite lands at the
-    /// correct file position. In Phase 1 (`shard_size==0`) this is always
-    /// 0 and `remaining_to_post` covers the whole file.
+struct ShardCursor {
+    file_idx: usize,
     byte_offset: u64,
+    byte_len: u64,
+    next_post_offset: u64,
+    is_owner: bool,
+    reader: Option<File>,
+    broadcaster: i32,
+}
+
+struct FileState {
+    needs_write: bool,
+    opened: bool,
+    closed: bool,
+    size: u64,
+    path: PathBuf,
+    shards_total: usize,
+    shards_posted: usize,
+    chunks_in_flight: usize,
+    writes_in_flight: usize,
 }
 
 struct InFlight {
     request: ffi::MPI_Request,
     slot: usize,
-    file_id: usize,
+    file_idx: usize,
     n: usize,
-    offset: u64,
+    abs_offset: u64,
 }
 
 enum WriterCmd {
     OpenFile {
-        file_id: usize,
+        file_idx: usize,
         file: File,
         size: u64,
     },
     Write {
-        file_id: usize,
+        file_idx: usize,
         slot: usize,
         n: usize,
         offset: u64,
         buf: AlignedBuf,
     },
     CloseFile {
-        file_id: usize,
+        file_idx: usize,
     },
 }
 
 struct WriteAck {
     slot: usize,
+    file_idx: usize,
     buf: AlignedBuf,
     err: Option<anyhow::Error>,
 }
@@ -198,128 +206,145 @@ fn drive_pipeline(
     cmd_txs: &[mpsc::Sender<WriterCmd>],
     ack_rx: &mpsc::Receiver<WriteAck>,
 ) -> Result<()> {
-    let mut files: Vec<Option<FileCtx>> = Vec::with_capacity(plan.len());
-    let mut next_file_idx: usize = 0;
-    let mut current_file: Option<usize> = None;
-    let mut current_broadcaster: i32 = 0;
+    // Pre-aggregate per-file state from the shard plan. Multiple shards
+    // of the same file collapse to one FileState (writer key, OpenFile/
+    // CloseFile dedup). The local file is expected to already exist at
+    // its full size (main.rs ftruncates every file this rank touches
+    // before invoking bcast); broadcast.rs only opens for write.
+    let mut file_state: HashMap<usize, FileState> = HashMap::new();
+    for s in plan {
+        let entry = &entries[s.file_idx];
+        let size = entry
+            .properties
+            .as_ref()
+            .and_then(|p| p.content_length)
+            .unwrap_or(0);
+        let path = args.dest.join(local_rel(&args.source, &entry.name));
+        let fs = file_state
+            .entry(s.file_idx)
+            .or_insert_with(|| FileState {
+                needs_write: false,
+                opened: false,
+                closed: false,
+                size,
+                path,
+                shards_total: 0,
+                shards_posted: 0,
+                chunks_in_flight: 0,
+                writes_in_flight: 0,
+            });
+        fs.shards_total += 1;
+    }
+    // needs_write iff this rank doesn't already have the file AND doesn't
+    // own every shard of it (i.e. at least one shard arrives over bcast).
+    for (&file_idx, fs) in file_state.iter_mut() {
+        let already_have = presence.has(rank, file_idx);
+        let owns_all = plan
+            .iter()
+            .filter(|s| s.file_idx == file_idx)
+            .all(|s| s.owner_rank == rank);
+        fs.needs_write = !already_have && !owns_all && fs.size > 0;
+    }
+
+    let mut next_plan_idx: usize = 0;
+    let mut active: Option<ShardCursor> = None;
     let mut writes_pending: usize = 0;
 
-    // MPI_Ibcast's count argument is a C `int`, so a single call cannot move
-    // more than i32::MAX bytes. We sub-chunk each logical pipeline chunk
-    // into ≤ MAX_SUB_BCAST byte sub-bcasts and only release / write a slot
-    // once all of its sub-requests have completed (out-of-order safe).
-    // Without this, --bcast-chunk == 2 GiB casts to i32::MIN and aborts
-    // (negative count); --bcast-chunk == 4 GiB / 8 GiB casts to 0 and
-    // silently broadcasts nothing while the writer commits stale buffer
-    // contents to disk.
-    const MAX_SUB_BCAST: usize = 1 << 30; // 1 GiB; comfortably below i32::MAX
+    // MPI_Ibcast count is a C int; cap each call at < i32::MAX. See v0.3.x
+    // for the original analysis.
+    const MAX_SUB_BCAST: usize = 1 << 30;
     let mut slot_subs_remaining: Vec<usize> = vec![0; buffers.len()];
 
     loop {
         while !free_slots.is_empty() {
-            if current_file.is_none() {
-                if next_file_idx >= plan.len() {
+            if active.is_none() {
+                if next_plan_idx >= plan.len() {
                     break;
                 }
-                let ShardSpec {
-                    file_idx,
-                    byte_offset,
-                    byte_len,
-                    owner_rank: broadcaster,
-                    ..
-                } = plan[next_file_idx];
-                next_file_idx += 1;
+                let s = &plan[next_plan_idx];
+                next_plan_idx += 1;
 
-                let entry = &entries[file_idx];
-                let file_size = entry
-                    .properties
-                    .as_ref()
-                    .and_then(|p| p.content_length)
-                    .unwrap_or(0);
-                let local_path = args.dest.join(local_rel(&args.source, &entry.name));
+                let file_idx = s.file_idx;
+                let is_owner = s.owner_rank == rank;
+                let broadcaster = s.owner_rank as i32;
 
-                let is_owner = broadcaster == rank;
-                let already_have = presence.has(rank, file_idx);
+                let fs = file_state.get(&file_idx).unwrap();
+                let path = fs.path.clone();
+                let size = fs.size;
+                let needs_write = fs.needs_write;
+                let already_opened = fs.opened;
 
-                let (reader, needs_write) = if is_owner {
-                    if byte_len == 0 {
-                        (None, false)
-                    } else {
-                        let mut r = File::open(&local_path)
-                            .with_context(|| format!("owner open {}", local_path.display()))?;
-                        if byte_offset > 0 {
-                            use std::io::{Seek, SeekFrom};
-                            r.seek(SeekFrom::Start(byte_offset)).with_context(|| {
-                                format!(
-                                    "owner seek {} to byte_offset={byte_offset}",
-                                    local_path.display()
-                                )
-                            })?;
-                        }
-                        (Some(r), false)
+                let reader = if is_owner && s.byte_len > 0 {
+                    let mut r = File::open(&path)
+                        .with_context(|| format!("owner open {}", path.display()))?;
+                    if s.byte_offset > 0 {
+                        use std::io::{Seek, SeekFrom};
+                        r.seek(SeekFrom::Start(s.byte_offset)).with_context(|| {
+                            format!(
+                                "owner seek {} to byte_offset={}",
+                                path.display(),
+                                s.byte_offset
+                            )
+                        })?;
                     }
-                } else if !already_have {
-                    ensure_parent(&local_path)?;
+                    Some(r)
+                } else {
+                    None
+                };
+
+                if needs_write && !already_opened {
                     let mut opts = OpenOptions::new();
-                    opts.create(true).write(true).truncate(true);
-                    if direct && file_size > 0 {
+                    opts.write(true);
+                    if direct {
                         opts.custom_flags(libc::O_DIRECT);
                     }
                     let w = opts
-                        .open(&local_path)
-                        .with_context(|| format!("receiver create {}", local_path.display()))?;
-                    if file_size == 0 {
-                        drop(w);
-                        (None, false)
-                    } else {
-                        let file_id = files.len();
-                        cmd_txs[file_id % cmd_txs.len()]
-                            .send(WriterCmd::OpenFile {
-                                file_id,
-                                file: w,
-                                size: file_size,
-                            })
-                            .map_err(|_| anyhow!("writer thread closed"))?;
-                        (None, true)
-                    }
-                } else {
-                    (None, false)
-                };
+                        .open(&path)
+                        .with_context(|| format!("receiver open {}", path.display()))?;
+                    cmd_txs[file_idx % cmd_txs.len()]
+                        .send(WriterCmd::OpenFile {
+                            file_idx,
+                            file: w,
+                            size,
+                        })
+                        .map_err(|_| anyhow!("writer thread closed"))?;
+                    file_state.get_mut(&file_idx).unwrap().opened = true;
+                }
 
-                let ctx = FileCtx {
-                    reader,
-                    remaining_to_post: byte_len,
+                if s.byte_len == 0 {
+                    let fs = file_state.get_mut(&file_idx).unwrap();
+                    fs.shards_posted += 1;
+                    maybe_close_file(&mut file_state, file_idx, cmd_txs)?;
+                    continue;
+                }
+
+                active = Some(ShardCursor {
+                    file_idx,
+                    byte_offset: s.byte_offset,
+                    byte_len: s.byte_len,
                     next_post_offset: 0,
-                    chunks_in_flight: 0,
                     is_owner,
-                    needs_write,
-                    path: local_path,
-                    byte_offset,
-                };
-                files.push(Some(ctx));
-                current_file = Some(files.len() - 1);
-                current_broadcaster = broadcaster as i32;
+                    reader,
+                    broadcaster,
+                });
             }
 
-            let fid = current_file.unwrap();
-            let ctx = files[fid].as_mut().unwrap();
-            if ctx.remaining_to_post == 0 {
-                current_file = None;
-                continue;
-            }
-
-            let n = ctx.remaining_to_post.min(chunk as u64) as usize;
-            let offset = ctx.next_post_offset;
+            let cur = active.as_mut().unwrap();
+            let remaining = cur.byte_len - cur.next_post_offset;
+            let n = remaining.min(chunk as u64) as usize;
+            let within_shard_offset = cur.next_post_offset;
+            let abs_offset = cur.byte_offset + within_shard_offset;
             let slot = free_slots.pop_front().unwrap();
             let buf = buffers[slot].as_mut().expect("free slot has buffer");
 
-            if ctx.is_owner {
-                ctx.reader
+            if cur.is_owner {
+                let path_for_err = file_state[&cur.file_idx].path.clone();
+                cur.reader
                     .as_mut()
                     .unwrap()
                     .read_exact(&mut buf.as_mut_slice()[..n])
                     .with_context(|| {
-                        format!("owner read {} bytes from {}", n, ctx.path.display())
+                        format!("owner read {} bytes from {}", n, path_for_err.display())
                     })?;
             }
 
@@ -333,7 +358,7 @@ fn drive_pipeline(
                         buf_ptr.add(sub_offset) as *mut std::ffi::c_void,
                         sub as i32,
                         ffi::RSMPI_UINT8_T,
-                        current_broadcaster,
+                        cur.broadcaster,
                         world.as_raw(),
                         &mut req,
                     )
@@ -344,20 +369,22 @@ fn drive_pipeline(
                 in_flight.push(InFlight {
                     request: req,
                     slot,
-                    file_id: fid,
+                    file_idx: cur.file_idx,
                     n,
-                    offset,
+                    abs_offset,
                 });
                 slot_subs_remaining[slot] += 1;
                 sub_offset += sub;
             }
 
-            ctx.chunks_in_flight += 1;
-            ctx.remaining_to_post -= n as u64;
-            ctx.next_post_offset += n as u64;
+            file_state.get_mut(&cur.file_idx).unwrap().chunks_in_flight += 1;
+            cur.next_post_offset += n as u64;
 
-            if ctx.remaining_to_post == 0 {
-                current_file = None;
+            if cur.next_post_offset >= cur.byte_len {
+                let fid = cur.file_idx;
+                file_state.get_mut(&fid).unwrap().shards_posted += 1;
+                active = None;
+                maybe_close_file(&mut file_state, fid, cmd_txs)?;
             }
         }
 
@@ -370,6 +397,9 @@ fn drive_pipeline(
                     buffers[ack.slot] = Some(ack.buf);
                     free_slots.push_back(ack.slot);
                     writes_pending -= 1;
+                    let fid = ack.file_idx;
+                    file_state.get_mut(&fid).unwrap().writes_in_flight -= 1;
+                    maybe_close_file(&mut file_state, fid, cmd_txs)?;
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
@@ -378,7 +408,11 @@ fn drive_pipeline(
             }
         }
 
-        if in_flight.is_empty() && writes_pending == 0 && next_file_idx >= plan.len() {
+        if in_flight.is_empty()
+            && writes_pending == 0
+            && next_plan_idx >= plan.len()
+            && active.is_none()
+        {
             break;
         }
 
@@ -392,6 +426,9 @@ fn drive_pipeline(
             buffers[ack.slot] = Some(ack.buf);
             free_slots.push_back(ack.slot);
             writes_pending -= 1;
+            let fid = ack.file_idx;
+            file_state.get_mut(&fid).unwrap().writes_in_flight -= 1;
+            maybe_close_file(&mut file_state, fid, cmd_txs)?;
             continue;
         }
 
@@ -412,47 +449,56 @@ fn drive_pipeline(
         let done = in_flight.swap_remove(completed_idx as usize);
         slot_subs_remaining[done.slot] -= 1;
         if slot_subs_remaining[done.slot] > 0 {
-            // Sub-bcast completed but more sub-chunks of this slot are still
-            // outstanding. Don't release/write the buffer yet.
             continue;
         }
-        let ctx = files[done.file_id].as_mut().unwrap();
-        ctx.chunks_in_flight -= 1;
 
-        let file_finished = ctx.chunks_in_flight == 0 && ctx.remaining_to_post == 0;
+        let fs = file_state.get_mut(&done.file_idx).unwrap();
+        fs.chunks_in_flight -= 1;
+        let needs_write = fs.needs_write;
 
-        if ctx.needs_write {
+        if needs_write {
             let buf = buffers[done.slot]
                 .take()
                 .expect("slot must hold buffer at completion");
-            cmd_txs[done.file_id % cmd_txs.len()]
+            cmd_txs[done.file_idx % cmd_txs.len()]
                 .send(WriterCmd::Write {
-                    file_id: done.file_id,
+                    file_idx: done.file_idx,
                     slot: done.slot,
                     n: done.n,
-                    // Phase-3-safe: pwrite at absolute file offset.
-                    // In Phase 1 ctx.byte_offset == 0, so this is a no-op.
-                    offset: ctx.byte_offset + done.offset,
+                    offset: done.abs_offset,
                     buf,
                 })
                 .map_err(|_| anyhow!("writer thread closed"))?;
             writes_pending += 1;
+            file_state.get_mut(&done.file_idx).unwrap().writes_in_flight += 1;
         } else {
             free_slots.push_back(done.slot);
         }
 
-        if file_finished {
-            if ctx.needs_write {
-                cmd_txs[done.file_id % cmd_txs.len()]
-                    .send(WriterCmd::CloseFile {
-                        file_id: done.file_id,
-                    })
-                    .map_err(|_| anyhow!("writer thread closed"))?;
-            }
-            files[done.file_id] = None;
-        }
+        maybe_close_file(&mut file_state, done.file_idx, cmd_txs)?;
     }
 
+    Ok(())
+}
+
+fn maybe_close_file(
+    file_state: &mut HashMap<usize, FileState>,
+    file_idx: usize,
+    cmd_txs: &[mpsc::Sender<WriterCmd>],
+) -> Result<()> {
+    let fs = file_state.get_mut(&file_idx).unwrap();
+    if !fs.opened
+        || fs.closed
+        || fs.shards_posted != fs.shards_total
+        || fs.chunks_in_flight != 0
+        || fs.writes_in_flight != 0
+    {
+        return Ok(());
+    }
+    cmd_txs[file_idx % cmd_txs.len()]
+        .send(WriterCmd::CloseFile { file_idx })
+        .map_err(|_| anyhow!("writer thread closed"))?;
+    fs.closed = true;
     Ok(())
 }
 
@@ -466,25 +512,28 @@ fn writer_loop(
     while let Ok(cmd) = cmd_rx.recv() {
         match cmd {
             WriterCmd::OpenFile {
-                file_id,
+                file_idx,
                 file,
                 size,
             } => {
-                files.insert(file_id, (file, size));
+                files.insert(file_idx, (file, size));
             }
             WriterCmd::Write {
-                file_id,
+                file_idx,
                 slot,
                 n,
                 offset,
                 buf,
             } => {
-                let err = match files.get(&file_id) {
+                let err = match files.get(&file_idx) {
                     Some((w, _size)) => {
-                        // O_DIRECT requires the write length to be a multiple of the
-                        // block size. The trailing chunk of a file may be shorter; round
-                        // up (writing junk past EOF from prior buffer contents) and fix
-                        // the tail at CloseFile via ftruncate to the true size.
+                        // O_DIRECT requires aligned write length; round up,
+                        // padding bytes from buffer's prior contents land past
+                        // the shard boundary. The CLI enforces
+                        // `shard_size % bcast_chunk == 0` so non-final shards
+                        // never have a short trailing write — only the file's
+                        // very last chunk does, and CloseFile's ftruncate
+                        // trims it.
                         let write_len = if direct {
                             (n + ALIGN - 1) & !(ALIGN - 1)
                         } else {
@@ -493,27 +542,36 @@ fn writer_loop(
                         let write_len = write_len.min(buf.cap);
                         w.write_all_at(&buf.as_slice()[..write_len], offset)
                             .err()
-                            .map(|e| anyhow!("write file_id={file_id} offset={offset}: {e}"))
+                            .map(|e| anyhow!("write file_idx={file_idx} offset={offset}: {e}"))
                     }
-                    None => Some(anyhow!("write to unknown file_id={file_id}")),
+                    None => Some(anyhow!("write to unknown file_idx={file_idx}")),
                 };
-                if ack_tx.send(WriteAck { slot, buf, err }).is_err() {
+                if ack_tx
+                    .send(WriteAck {
+                        slot,
+                        file_idx,
+                        buf,
+                        err,
+                    })
+                    .is_err()
+                {
                     return Ok(());
                 }
             }
-            WriterCmd::CloseFile { file_id } => {
-                if let Some((f, size)) = files.remove(&file_id) {
+            WriterCmd::CloseFile { file_idx } => {
+                if let Some((f, size)) = files.remove(&file_idx) {
                     if direct {
                         if let Err(e) = f.set_len(size) {
                             if deferred_err.is_none() {
-                                deferred_err = Some(anyhow!("ftruncate file_id={file_id}: {e}"));
+                                deferred_err =
+                                    Some(anyhow!("ftruncate file_idx={file_idx}: {e}"));
                             }
                             continue;
                         }
                     }
                     if let Err(e) = f.sync_all() {
                         if deferred_err.is_none() {
-                            deferred_err = Some(anyhow!("close file_id={file_id}: {e}"));
+                            deferred_err = Some(anyhow!("close file_idx={file_idx}: {e}"));
                         }
                     }
                 }
@@ -524,12 +582,4 @@ fn writer_loop(
         Some(e) => Err(e),
         None => Ok(()),
     }
-}
-
-fn ensure_parent(path: &Path) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| anyhow!("mkdir -p {}: {e}", parent.display()))?;
-    }
-    Ok(())
 }

@@ -7,16 +7,21 @@ mod timing;
 use std::process::ExitCode;
 
 use clap::Parser;
+use mpi::collective::CommunicatorCollectives;
 use mpi::environment;
 use mpi::ffi;
 use mpi::traits::*;
 
-use azcp::BlobItem;
+use azcp::{BlobItem, DownloadRange};
 
 use cli::{Args, Stage};
 
 fn main() -> ExitCode {
     let args = Args::parse();
+    if let Err(e) = args.validate() {
+        eprintln!("[fatal] invalid arguments: {e}");
+        return ExitCode::from(2);
+    }
 
     let universe = mpi::initialize().expect("MPI_Init failed");
     let world = universe.world();
@@ -158,38 +163,135 @@ fn main() -> ExitCode {
     bcast_plan.extend(classification.bcast_only.iter().copied());
     bcast_plan.sort_by_key(|(idx, _)| *idx);
 
-    // Phase 1 of range-sharding: lift the legacy `(file_idx, owner)` plan
-    // into the richer `Vec<ShardSpec>` shape used by the broadcast loop.
-    // At `shard_size==0` (the only path today) every file contributes
-    // exactly one shard covering its full byte range, so the wire-level
-    // behavior is bit-identical to v0.3.1.
-    let bcast_shards: Vec<stages::shards::ShardSpec> = bcast_plan
+    // Resolve effective shard_size: explicit --shard-size wins; else
+    // derive from --file-shards over the largest downloaded file; else 0
+    // (one shard per file, v0.3.1 plan shape).
+    let bcast_chunk_u64 = args.bcast_chunk as u64;
+    let effective_shard_size: u64 = if args.shard_size > 0 {
+        args.shard_size
+    } else if let Some(n) = args.file_shards {
+        stages::shards::compute_shard_size_from_file_shards(
+            &download_entries,
+            n,
+            bcast_chunk_u64,
+        )
+    } else {
+        0
+    };
+    if rank == 0 && effective_shard_size > 0 {
+        println!(
+            "[shard] range-sharding active: shard_size={} bytes ({} chunks/shard)",
+            effective_shard_size,
+            effective_shard_size / bcast_chunk_u64
+        );
+    }
+
+    // Build the range-shard plan over downloaded entries; LPT assigns
+    // each shard to one of the download ranks. Then re-key file_idx
+    // back to the original `entries[]` index space and append the
+    // bcast_only entries (presence-determined broadcaster, 1 shard each).
+    let download_shards =
+        stages::shards::compute_shards(&download_entries, download_rank_count, effective_shard_size);
+
+    let mut bcast_shards: Vec<stages::shards::ShardSpec> = Vec::with_capacity(
+        download_shards.len() + classification.bcast_only.len(),
+    );
+    for s in &download_shards {
+        let entries_idx = classification.needs_download[s.file_idx];
+        bcast_shards.push(stages::shards::ShardSpec {
+            file_idx: entries_idx,
+            shard_idx: s.shard_idx,
+            byte_offset: s.byte_offset,
+            byte_len: s.byte_len,
+            owner_rank: s.owner_rank,
+        });
+    }
+    for &(file_idx, owner_rank) in &classification.bcast_only {
+        let byte_len = entries[file_idx]
+            .properties
+            .as_ref()
+            .and_then(|p| p.content_length)
+            .unwrap_or(0);
+        bcast_shards.push(stages::shards::ShardSpec {
+            file_idx,
+            shard_idx: 0,
+            byte_offset: 0,
+            byte_len,
+            owner_rank,
+        });
+    }
+    bcast_shards.sort_by_key(|s| (s.file_idx, s.shard_idx));
+
+    // Per-rank download ranges: this rank downloads the byte-ranges of
+    // the shards it owns. Local paths absolute under args.dest.
+    let my_ranges: Vec<DownloadRange> = download_shards
         .iter()
-        .map(|&(file_idx, owner_rank)| {
-            let byte_len = entries[file_idx]
-                .properties
-                .as_ref()
-                .and_then(|p| p.content_length)
-                .unwrap_or(0);
-            stages::shards::ShardSpec {
-                file_idx,
-                shard_idx: 0,
-                byte_offset: 0,
-                byte_len,
-                owner_rank,
+        .filter(|s| s.owner_rank == rank as usize)
+        .map(|s| {
+            let entry = &download_entries[s.file_idx];
+            let local_path = args.dest.join(paths::local_rel(&args.source, &entry.name));
+            DownloadRange {
+                blob_name: entry.name.clone(),
+                local_path,
+                byte_offset: s.byte_offset,
+                byte_len: s.byte_len,
             }
         })
         .collect();
 
-    let my_bytes: u64 = my_entries
-        .iter()
-        .map(|e| {
-            e.properties
+    // Pre-truncate every file this rank will touch (download or receive)
+    // up-front. Both download_ranges and bcast writers expect the file
+    // to exist at full size with no in-flight truncate races.
+    {
+        use std::collections::HashSet;
+        let mut files_to_create: HashSet<usize> = HashSet::new();
+        for s in &bcast_shards {
+            if !presence.has(rank as usize, s.file_idx) {
+                files_to_create.insert(s.file_idx);
+            }
+        }
+        for file_idx in files_to_create {
+            let entry = &entries[file_idx];
+            let size = entry
+                .properties
                 .as_ref()
                 .and_then(|p| p.content_length)
-                .unwrap_or(0)
-        })
-        .sum();
+                .unwrap_or(0);
+            let local_path = args.dest.join(paths::local_rel(&args.source, &entry.name));
+            if let Some(parent) = local_path.parent() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    eprintln!(
+                        "rank {rank}: mkdir -p {} failed: {e}",
+                        parent.display()
+                    );
+                    unsafe { ffi::MPI_Abort(world.as_raw(), 8) };
+                    return ExitCode::from(8);
+                }
+            }
+            let f = match std::fs::File::create(&local_path) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!(
+                        "rank {rank}: create {} failed: {e}",
+                        local_path.display()
+                    );
+                    unsafe { ffi::MPI_Abort(world.as_raw(), 8) };
+                    return ExitCode::from(8);
+                }
+            };
+            if let Err(e) = f.set_len(size) {
+                eprintln!(
+                    "rank {rank}: ftruncate {} to {} failed: {e}",
+                    local_path.display(),
+                    size
+                );
+                unsafe { ffi::MPI_Abort(world.as_raw(), 8) };
+                return ExitCode::from(8);
+            }
+        }
+    }
+
+    let my_bytes: u64 = my_ranges.iter().map(|r| r.byte_len).sum();
     let download_bytes: u64 = download_entries
         .iter()
         .map(|e| {
@@ -199,19 +301,10 @@ fn main() -> ExitCode {
                 .unwrap_or(0)
         })
         .sum();
-    let bcast_bytes: u64 = bcast_plan
-        .iter()
-        .map(|(idx, _)| {
-            entries[*idx]
-                .properties
-                .as_ref()
-                .and_then(|p| p.content_length)
-                .unwrap_or(0)
-        })
-        .sum();
+    let bcast_bytes: u64 = bcast_shards.iter().map(|s| s.byte_len).sum();
     eprintln!(
-        "[shard] rank {rank}: {} files, {} bytes",
-        my_entries.len(),
+        "[shard] rank {rank}: {} ranges, {} bytes",
+        my_ranges.len(),
         my_bytes
     );
 
@@ -219,7 +312,7 @@ fn main() -> ExitCode {
         0.0
     } else {
         let t0 = environment::time();
-        if let Err(err) = stages::download::run(&args, my_entries.clone(), per_rank_bandwidth) {
+        if let Err(err) = stages::download::run(&args, my_ranges.clone(), per_rank_bandwidth) {
             eprintln!("rank {rank}: download stage failed: {err:#}");
             unsafe { ffi::MPI_Abort(world.as_raw(), 5) };
             return ExitCode::from(5);
@@ -238,6 +331,11 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    // Synchronize all ranks before bcast: each receiver opens its
+    // pre-truncated file with O_DIRECT, and downloaders must have
+    // finished pwriting before owners read from those files.
+    world.barrier();
+
     let t0 = environment::time();
     if let Err(err) = stages::broadcast::run(&world, &args, &entries, &bcast_shards, &presence) {
         eprintln!("rank {rank}: broadcast stage failed: {err:#}");
@@ -247,8 +345,8 @@ fn main() -> ExitCode {
     let t_bcast = environment::time() - t0;
     if rank == 0 {
         println!(
-            "[bcast] {} files {} bytes T={:.2}s BW={}",
-            bcast_plan.len(),
+            "[bcast] {} shards {} bytes T={:.2}s BW={}",
+            bcast_shards.len(),
             bcast_bytes,
             t_bcast,
             timing::human_bw(bcast_bytes, t_bcast)

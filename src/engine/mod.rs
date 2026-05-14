@@ -2,6 +2,7 @@ pub mod progress;
 pub mod rate_limiter;
 
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -978,6 +979,223 @@ impl TransferEngine {
             skipped: 0,
         })
     }
+
+    /// Download a flat list of byte-ranges to caller-specified local paths.
+    ///
+    /// Unlike [`Self::download_entries`], the caller decides which bytes
+    /// of which blob land where. Local files are NOT created or
+    /// truncated — caller is expected to have pre-allocated them
+    /// (`File::create` + `set_len`) before calling. Ranges sharing a
+    /// `local_path` share one `Arc<File>` and pwrite to disjoint
+    /// offsets concurrently. Multi-rail clusters use this to download
+    /// disjoint shards of one file from multiple ranks into one local
+    /// file each.
+    pub async fn download_ranges(
+        self: &Arc<Self>,
+        ranges: Vec<DownloadRange>,
+        account: &str,
+        container: &str,
+    ) -> Result<TransferSummary> {
+        use std::collections::HashMap;
+        let mut by_path: HashMap<PathBuf, Vec<DownloadRange>> = HashMap::new();
+        for r in ranges {
+            by_path.entry(r.local_path.clone()).or_default().push(r);
+        }
+        let total_files = by_path.len() as u64;
+        let total_bytes: u64 = by_path
+            .values()
+            .flat_map(|v| v.iter())
+            .map(|r| r.byte_len)
+            .sum();
+
+        if self.config.dry_run {
+            for (path, group) in &by_path {
+                for r in group {
+                    println!(
+                        "  [dry-run] would download {} [{}, {}) -> {}",
+                        r.blob_name,
+                        r.byte_offset,
+                        r.byte_offset + r.byte_len,
+                        path.display()
+                    );
+                }
+            }
+            return Ok(TransferSummary {
+                total_files,
+                total_bytes,
+                succeeded: total_files,
+                failed: 0,
+                skipped: 0,
+            });
+        }
+
+        let progress = if let Some(p) = &self.shared_progress {
+            p.add_total(total_files, total_bytes);
+            p.attach_retry_stats(self.client.retry_stats());
+            p.clone()
+        } else {
+            let p = Arc::new(TransferProgress::new(
+                total_files,
+                total_bytes,
+                self.config.progress,
+            ));
+            p.attach_retry_stats(self.client.retry_stats());
+            p
+        };
+        let owns_progress = self.shared_progress.is_none();
+
+        let block_size = self.config.block_size;
+        let direct = self.config.direct;
+
+        let mut file_tasks: JoinSet<(PathBuf, Result<()>)> = JoinSet::new();
+
+        for (local_path, group) in by_path {
+            let file_permit = self.file_semaphore.clone().acquire_owned().await.unwrap();
+
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true);
+            #[cfg(target_os = "linux")]
+            if direct {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.custom_flags(libc::O_DIRECT);
+            }
+            let shared_file = Arc::new(opts.open(&local_path).map_err(|e| {
+                AzcpError::Transfer(format!("open {}: {e}", local_path.display()))
+            })?);
+
+            let chunk_sem = self.semaphore.clone();
+            let client = self.client.clone();
+            let rate_limiter = self.rate_limiter.clone();
+            let progress_c = progress.clone();
+            let acct = account.to_string();
+            let ctr = container.to_string();
+            let path_for_task = local_path.clone();
+            let group_bytes: u64 = group.iter().map(|r| r.byte_len).sum();
+
+            file_tasks.spawn(async move {
+                let _file_permit = file_permit;
+                let path_for_err = path_for_task.clone();
+                let r: Result<()> = async move {
+                    let pb = progress_c.create_file_bar(group_bytes);
+                    pb.set_message(path_for_task.display().to_string());
+
+                    let mut handles: Vec<tokio::task::JoinHandle<Result<()>>> = Vec::new();
+                    for range in &group {
+                        if range.byte_len == 0 {
+                            continue;
+                        }
+                        let n_chunks = range.byte_len.div_ceil(block_size);
+                        for i in 0..n_chunks {
+                            let chunk_off = i * block_size;
+                            let length = std::cmp::min(block_size, range.byte_len - chunk_off);
+                            let abs_offset = range.byte_offset + chunk_off;
+
+                            let permit = chunk_sem.clone().acquire_owned().await.unwrap();
+                            let client_c = client.clone();
+                            let rl_c = rate_limiter.clone();
+                            let acct_c = acct.clone();
+                            let ctr_c = ctr.clone();
+                            let blob_name_c = range.blob_name.clone();
+                            let file_c = shared_file.clone();
+                            let pb_c2 = pb.clone();
+                            let prog_c2 = progress_c.clone();
+
+                            handles.push(tokio::spawn(async move {
+                                let _permit = permit;
+                                if let Some(rl) = &rl_c {
+                                    rl.acquire(length).await;
+                                }
+                                let data = client_c
+                                    .get_blob_range(
+                                        &acct_c,
+                                        &ctr_c,
+                                        &blob_name_c,
+                                        abs_offset,
+                                        length,
+                                    )
+                                    .await?;
+                                let n = data.len() as u64;
+                                tokio::task::spawn_blocking(move || {
+                                    if direct {
+                                        pwrite_all_direct(&file_c, &data, abs_offset)
+                                    } else {
+                                        pwrite_all(&file_c, &data, abs_offset)
+                                    }
+                                })
+                                .await
+                                .map_err(|e| AzcpError::Transfer(e.to_string()))?
+                                .map_err(|e| AzcpError::Transfer(e.to_string()))?;
+                                pb_c2.inc(n);
+                                prog_c2.add_bytes(n);
+                                Ok(())
+                            }));
+                        }
+                    }
+
+                    let mut err: Option<AzcpError> = None;
+                    for h in handles {
+                        match h.await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) if err.is_none() => err = Some(e),
+                            Ok(Err(_)) => {}
+                            Err(e) if err.is_none() => {
+                                err = Some(AzcpError::Transfer(e.to_string()))
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                    pb.finish_and_clear();
+                    if let Some(e) = err {
+                        return Err(e);
+                    }
+                    progress_c.complete_file();
+                    Ok(())
+                }
+                .await;
+                (path_for_err, r)
+            });
+        }
+
+        let mut succeeded = 0u64;
+        let mut failed = 0u64;
+        while let Some(joined) = file_tasks.join_next().await {
+            match joined {
+                Ok((_, Ok(()))) => succeeded += 1,
+                Ok((path, Err(e))) => {
+                    failed += 1;
+                    eprintln!("ERROR: {}: {e}", path.display());
+                }
+                Err(e) => {
+                    failed += 1;
+                    eprintln!("ERROR: <task join>: {e}");
+                }
+            }
+        }
+
+        if owns_progress {
+            progress.finish();
+        }
+
+        Ok(TransferSummary {
+            total_files,
+            total_bytes,
+            succeeded,
+            failed,
+            skipped: 0,
+        })
+    }
+}
+
+/// One byte-range download request: read `[byte_offset, byte_offset+byte_len)`
+/// of `blob_name` and pwrite it to `local_path` at the same absolute
+/// offset. The local file must already exist with sufficient length;
+/// [`TransferEngine::download_ranges`] does NOT create or truncate it.
+#[derive(Debug, Clone)]
+pub struct DownloadRange {
+    pub blob_name: String,
+    pub local_path: PathBuf,
+    pub byte_offset: u64,
+    pub byte_len: u64,
 }
 
 // Parse a shardlist file produced by `azcp ls --recursive --machine-readable`.
