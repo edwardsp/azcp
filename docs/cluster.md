@@ -140,14 +140,16 @@ that the fabric path beat per-node Azure egress.
 Defaults are reasonable for 8-32 nodes on a 100-200 GbE fabric. The knobs
 that matter for bcast performance:
 
-- `--shard-size` / `--file-shards` — **the biggest lever in v0.4.** With
-  large files (10+ GiB) and few of them (≤ N ranks), the legacy "one
-  broadcaster per file" plan leaves most ranks idle during bcast.
-  Range-sharding splits each file into multiple owners that broadcast in
-  parallel. On a 16-node ND H100 v5 cluster with 1.2 TB / 6 files, this
-  lifts bcast bandwidth from ~44 Gb/s (legacy) to **~134 Gb/s** at
-  `--shard-size 8GiB` — a 3× win. See [Range sharding](#range-sharding)
-  below.
+- `--shard-size` / `--file-shards` — **the biggest lever in v0.4 for
+  few-large-file workloads.** With large files (10+ GiB) and few of them
+  (≤ N ranks), the legacy "one broadcaster per file" plan leaves most
+  ranks idle during bcast. Range-sharding splits each file into multiple
+  owners that broadcast in parallel. On a 16-node ND H100 v5 cluster
+  with 1.2 TB / 6 files, this lifts bcast bandwidth from ~44 Gb/s
+  (legacy) to **~134 Gb/s** at `--shard-size 8GiB` — a 3× win. On
+  many-file workloads (≥ ~10× ranks) sharding is a no-op (within 2%);
+  the default `--shard-size 8GiB` is safe in both regimes. See
+  [Range sharding](#range-sharding) below.
 - `--bcast-chunk` — too small and you pay MPI per-message overhead per
   chunk; too large and you serialize the bcast (no overlap with the next
   chunk). 64 MiB is the default. On RDMA fabrics with deep queues we've
@@ -196,18 +198,34 @@ number of pieces of the largest file (e.g. `--file-shards 16` on a
 200 GiB file → ~12.5 GiB shards, rounded up to a `--bcast-chunk`
 multiple).
 
-Constraints:
+#### When sharding helps (and when it doesn't)
+
+The win comes from adding broadcasters when fan-out is the bottleneck.
+
+| Workload shape | Effect of `--shard-size 8GiB` |
+|---|---|
+| Files < ranks, large (≥ 16 GiB each) | **3× bcast bandwidth.** The headline case. |
+| Files ≥ ~10× ranks, mixed sizes | **No-op (within 2%).** Per-file fan-out already saturates the plan. Tested on a real 524-blob LLM checkpoint: 84 Gb/s either way. |
+
+`--shard-size 8GiB` is therefore safe as a default: free on saturated
+plans, transformative on under-saturated ones. See
+[cluster-v0.4-shard-size-sweep.md](cluster-v0.4-shard-size-sweep.md) for
+both datasets side-by-side.
+
+#### Constraints
 
 - `--shard-size % --bcast-chunk == 0` is enforced (so `O_DIRECT` padding
   never straddles shard boundaries; only each file's final chunk needs
-  trim).
+  trim). With the default `--bcast-chunk 64M`, every power-of-two shard
+  size from 64 MiB upward is valid. With `--bcast-chunk 1GiB` (H100
+  tuning recipe), the smallest valid shard is 1 GiB.
 - `--shard-size` and `--file-shards` are mutually exclusive.
 - `--shard-size 0` reproduces v0.3.1 behaviour exactly (validated against
   baseline: 43.8 Gb/s vs historical 42.5 Gb/s, within noise).
 
-Range sharding also accelerates the **download** stage: more
-independent units of work give the LIST→GET pipeline more to chew on
-(137 → 243 Gb/s in the table above).
+Range sharding also accelerates the **download** stage on few-large-file
+workloads: more independent units of work give the LIST→GET pipeline
+more to chew on (137 → 243 Gb/s in the table above).
 
 ### `--bcast-chunk` and `--bcast-pipeline`
 

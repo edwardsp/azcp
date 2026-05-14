@@ -54,9 +54,11 @@ azcp-cluster <src> <dst> \
 > to range-shard each file across multiple owners and lift bcast to
 > ~134 Gb/s — see
 > [cluster-v0.4-shard-size-sweep.md](cluster-v0.4-shard-size-sweep.md).
-> The 524-file DeepSeek workload above doesn't benefit from this
-> (already plenty of parallel broadcasters), so the recipe is left
-> unchanged.
+>
+> The 524-file DeepSeek workload above already saturates per-file
+> fan-out (524 ≫ 16 ranks), so `--shard-size` is a measured no-op
+> there (84 Gb/s either way) — the recipe is left unchanged. The
+> default is safe to set across both regimes.
 
 ---
 
