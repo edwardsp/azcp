@@ -1,6 +1,6 @@
 [package]
 name = "azcp-cluster"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 description = "MPI-based cluster broadcast copy for azcp"
 
