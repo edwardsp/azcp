@@ -158,6 +158,29 @@ fn main() -> ExitCode {
     bcast_plan.extend(classification.bcast_only.iter().copied());
     bcast_plan.sort_by_key(|(idx, _)| *idx);
 
+    // Phase 1 of range-sharding: lift the legacy `(file_idx, owner)` plan
+    // into the richer `Vec<ShardSpec>` shape used by the broadcast loop.
+    // At `shard_size==0` (the only path today) every file contributes
+    // exactly one shard covering its full byte range, so the wire-level
+    // behavior is bit-identical to v0.3.1.
+    let bcast_shards: Vec<stages::shards::ShardSpec> = bcast_plan
+        .iter()
+        .map(|&(file_idx, owner_rank)| {
+            let byte_len = entries[file_idx]
+                .properties
+                .as_ref()
+                .and_then(|p| p.content_length)
+                .unwrap_or(0);
+            stages::shards::ShardSpec {
+                file_idx,
+                shard_idx: 0,
+                byte_offset: 0,
+                byte_len,
+                owner_rank,
+            }
+        })
+        .collect();
+
     let my_bytes: u64 = my_entries
         .iter()
         .map(|e| {
@@ -216,7 +239,7 @@ fn main() -> ExitCode {
     }
 
     let t0 = environment::time();
-    if let Err(err) = stages::broadcast::run(&world, &args, &entries, &bcast_plan, &presence) {
+    if let Err(err) = stages::broadcast::run(&world, &args, &entries, &bcast_shards, &presence) {
         eprintln!("rank {rank}: broadcast stage failed: {err:#}");
         unsafe { ffi::MPI_Abort(world.as_raw(), 6) };
         return ExitCode::from(6);

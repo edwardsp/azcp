@@ -18,6 +18,7 @@ use azcp::BlobItem;
 use crate::cli::Args;
 use crate::paths::local_rel;
 use crate::stages::presence::Presence;
+use crate::stages::shards::ShardSpec;
 
 const ALIGN: usize = 4096;
 
@@ -64,6 +65,11 @@ struct FileCtx {
     is_owner: bool,
     needs_write: bool,
     path: PathBuf,
+    /// File-absolute byte offset at which this shard begins. The writer
+    /// receives `byte_offset + offset_within_shard` so pwrite lands at the
+    /// correct file position. In Phase 1 (`shard_size==0`) this is always
+    /// 0 and `remaining_to_post` covers the whole file.
+    byte_offset: u64,
 }
 
 struct InFlight {
@@ -102,7 +108,7 @@ pub fn run(
     world: &SimpleCommunicator,
     args: &Args,
     entries: &[BlobItem],
-    plan: &[(usize, usize)],
+    plan: &[ShardSpec],
     presence: &Presence,
 ) -> Result<()> {
     let rank = world.rank() as usize;
@@ -181,7 +187,7 @@ fn drive_pipeline(
     world: &SimpleCommunicator,
     args: &Args,
     entries: &[BlobItem],
-    plan: &[(usize, usize)],
+    plan: &[ShardSpec],
     presence: &Presence,
     rank: usize,
     chunk: usize,
@@ -215,11 +221,17 @@ fn drive_pipeline(
                 if next_file_idx >= plan.len() {
                     break;
                 }
-                let (file_idx, broadcaster) = plan[next_file_idx];
+                let ShardSpec {
+                    file_idx,
+                    byte_offset,
+                    byte_len,
+                    owner_rank: broadcaster,
+                    ..
+                } = plan[next_file_idx];
                 next_file_idx += 1;
 
                 let entry = &entries[file_idx];
-                let size = entry
+                let file_size = entry
                     .properties
                     .as_ref()
                     .and_then(|p| p.content_length)
@@ -230,24 +242,33 @@ fn drive_pipeline(
                 let already_have = presence.has(rank, file_idx);
 
                 let (reader, needs_write) = if is_owner {
-                    if size == 0 {
+                    if byte_len == 0 {
                         (None, false)
                     } else {
-                        let r = File::open(&local_path)
+                        let mut r = File::open(&local_path)
                             .with_context(|| format!("owner open {}", local_path.display()))?;
+                        if byte_offset > 0 {
+                            use std::io::{Seek, SeekFrom};
+                            r.seek(SeekFrom::Start(byte_offset)).with_context(|| {
+                                format!(
+                                    "owner seek {} to byte_offset={byte_offset}",
+                                    local_path.display()
+                                )
+                            })?;
+                        }
                         (Some(r), false)
                     }
                 } else if !already_have {
                     ensure_parent(&local_path)?;
                     let mut opts = OpenOptions::new();
                     opts.create(true).write(true).truncate(true);
-                    if direct && size > 0 {
+                    if direct && file_size > 0 {
                         opts.custom_flags(libc::O_DIRECT);
                     }
                     let w = opts
                         .open(&local_path)
                         .with_context(|| format!("receiver create {}", local_path.display()))?;
-                    if size == 0 {
+                    if file_size == 0 {
                         drop(w);
                         (None, false)
                     } else {
@@ -256,7 +277,7 @@ fn drive_pipeline(
                             .send(WriterCmd::OpenFile {
                                 file_id,
                                 file: w,
-                                size,
+                                size: file_size,
                             })
                             .map_err(|_| anyhow!("writer thread closed"))?;
                         (None, true)
@@ -267,12 +288,13 @@ fn drive_pipeline(
 
                 let ctx = FileCtx {
                     reader,
-                    remaining_to_post: size,
+                    remaining_to_post: byte_len,
                     next_post_offset: 0,
                     chunks_in_flight: 0,
                     is_owner,
                     needs_write,
                     path: local_path,
+                    byte_offset,
                 };
                 files.push(Some(ctx));
                 current_file = Some(files.len() - 1);
@@ -408,7 +430,9 @@ fn drive_pipeline(
                     file_id: done.file_id,
                     slot: done.slot,
                     n: done.n,
-                    offset: done.offset,
+                    // Phase-3-safe: pwrite at absolute file offset.
+                    // In Phase 1 ctx.byte_offset == 0, so this is a no-op.
+                    offset: ctx.byte_offset + done.offset,
                     buf,
                 })
                 .map_err(|_| anyhow!("writer thread closed"))?;

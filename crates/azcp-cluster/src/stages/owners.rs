@@ -1,36 +1,18 @@
 use azcp::BlobItem;
 
+use crate::stages::shards::compute_shards;
+
+/// Legacy file-level owner mapping. Returns one owner rank per entry,
+/// in original-file order. Equivalent to projecting `owner_rank` out of
+/// `compute_shards(entries, count, 0)` (one shard per file).
+///
+/// Kept as a thin wrapper so call sites that don't yet need range
+/// sharding can stay unchanged. New code should prefer `compute_shards`.
 pub fn compute(entries: &[BlobItem], count: usize) -> Vec<usize> {
-    let n = entries.len();
-    if count <= 1 {
-        return vec![0; n];
-    }
-    let mut indexed: Vec<(usize, u64, &str)> = entries
-        .iter()
-        .enumerate()
-        .map(|(i, e)| {
-            let sz = e
-                .properties
-                .as_ref()
-                .and_then(|p| p.content_length)
-                .unwrap_or(0);
-            (i, sz, e.name.as_str())
-        })
-        .collect();
-    indexed.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.2.cmp(b.2)));
-    let mut loads = vec![0u64; count];
-    let mut owner = vec![0usize; n];
-    for (orig_idx, sz, _) in &indexed {
-        let bin = loads
-            .iter()
-            .enumerate()
-            .min_by(|(ai, al), (bi, bl)| al.cmp(bl).then_with(|| ai.cmp(bi)))
-            .map(|(b, _)| b)
-            .unwrap_or(0);
-        loads[bin] = loads[bin].saturating_add(*sz);
-        owner[*orig_idx] = bin;
-    }
-    owner
+    compute_shards(entries, count, 0)
+        .into_iter()
+        .map(|s| s.owner_rank)
+        .collect()
 }
 
 #[cfg(test)]
