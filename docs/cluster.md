@@ -91,10 +91,15 @@ azcp-cluster <SOURCE> <DEST> [flags]
 | `--block-size N` | 16 MiB | Block size for downloads. |
 | `--parallel-files N` | 16 | Files actively downloading concurrently per rank. |
 | `--bcast-chunk N` | 64 MiB | Chunk size for `MPI_Bcast`. Tune for fabric — see [Tuning](#tuning) below. |
-| `--bcast-pipeline N` | 4 | Number of bcast chunks in flight per file. Higher = more pipelining, more memory. |
+| `--bcast-pipeline N` | 1 | Number of bcast chunks in flight per file. Higher = more pipelining, more memory (`bcast_pipeline * bcast_chunk` per rank). Defaults to 1; raise on RDMA / multi-rail where extra concurrency actually finds more bandwidth. |
+| `--bcast-writers N` | 2 | Receiver-side writer threads. Single-threaded buffered writes can bottleneck below NVMe line rate; fanning across multiple threads (dispatched by `file_id % N`) restores throughput. Owner ranks unaffected. |
+| `--no-bcast-direct` | — | Disable `O_DIRECT` for bcast output files. By default writes bypass the page cache, lifting single-thread NVMe write throughput from ~47 → ~100 Gb/s. Set this on filesystems that don't support `O_DIRECT` (NFS, some FUSE mounts). |
+| `--shard-size N` | 0 | Range-shard each file into byte chunks of this size before distributing across ranks. `0` = one shard per file (legacy v0.3.1 plan shape). When `>0`, must be a multiple of `--bcast-chunk`. Accepts byte sizes with units: `32GiB`, `1GB`, `16777216`. Mutually exclusive with `--file-shards`. See [Range sharding](#range-sharding) below. |
+| `--file-shards N` | (off) | Convenience knob: derive `--shard-size` as `ceil(max_file_size / N)` rounded up to a multiple of `--bcast-chunk`. Mutually exclusive with `--shard-size`. |
 | `--max-retries N` | 5 | Per-HTTP-request retry budget. |
 | `--max-bandwidth RATE` | (off) | Cap **total cluster** download throughput. Accepts bit/byte units (`50Gbps`, `1GB/s`, `500MiB/s`). Divided across active downloader ranks: each gets `RATE / K`. See [Throughput limits](#throughput-limits) below. |
 | `--download-ranks K` | (= world size) | Only ranks `0..K-1` download from Azure; the remaining ranks skip the download phase and only receive via `MPI_Bcast`. Use to avoid 503 throttling when too many ranks hit one storage account. See [Limiting downloader count](#limiting-downloader-count) below. |
+| `--verify` | — | After bcast, every rank MD5s its local copy of every file and MPI-Allgathers the digests; mismatch across ranks (or vs. `Content-MD5` when present) exits non-zero. Adds ~25-30 s on a 1.2 TB / 6-file workload. |
 | `--no-progress` | — | Disable per-rank progress bars (default: TTY-aware). |
 
 ## Stages and timing output
@@ -132,22 +137,89 @@ that the fabric path beat per-node Azure egress.
 
 ## Tuning
 
-Defaults are reasonable for 8-32 nodes on a 100-200 GbE fabric. Two knobs
-matter for bcast performance:
+Defaults are reasonable for 8-32 nodes on a 100-200 GbE fabric. The knobs
+that matter for bcast performance:
+
+- `--shard-size` / `--file-shards` — **the biggest lever in v0.4.** With
+  large files (10+ GiB) and few of them (≤ N ranks), the legacy "one
+  broadcaster per file" plan leaves most ranks idle during bcast.
+  Range-sharding splits each file into multiple owners that broadcast in
+  parallel. On a 16-node ND H100 v5 cluster with 1.2 TB / 6 files, this
+  lifts bcast bandwidth from ~44 Gb/s (legacy) to **~134 Gb/s** at
+  `--shard-size 8GiB` — a 3× win. See [Range sharding](#range-sharding)
+  below.
+- `--bcast-chunk` — too small and you pay MPI per-message overhead per
+  chunk; too large and you serialize the bcast (no overlap with the next
+  chunk). 64 MiB is the default. On RDMA fabrics with deep queues we've
+  measured improvements at 256 MiB; on TCP, smaller chunks (16 MiB) are
+  often better.
+- `--bcast-pipeline` — number of chunks per file in flight. Defaults to 1
+  (TCP-friendly; OpenMPI's MPI_Bcast already pipelines internally). On
+  RDMA fabrics raise to 4-8.
+- `--bcast-writers` — receiver write threads. Defaults to 2; on NVMe with
+  `--shard-size > 0` you'll often want 4-8 to keep up with multiple
+  in-flight broadcasters per node.
+
+For first-run tuning, start with `--shard-size 8GiB` (if your files are
+≥ 16 GiB) and watch the `[bcast] BW` line. See
+[cluster-benchmarks.md](cluster-benchmarks.md) and
+[cluster-h100-tuning.md](cluster-h100-tuning.md) for empirical sweeps.
+
+### Range sharding
+
+By default each file has exactly one broadcaster (the rank that
+downloaded it). For workloads with **fewer files than ranks** (typical of
+LLM checkpoints: a handful of multi-GB shard files), this caps bcast
+bandwidth at "what one sender + one receiver pair can push through the
+fabric" — usually 40-50 Gb/s on a 200 GbE NDR rail.
+
+Range sharding (`--shard-size N`) cuts each file into byte ranges of
+size `N` and assigns each range to a different owner rank via the same
+size-balanced LPT bin packing used for files. Multiple owners now
+broadcast slices of the same file in parallel, multiplying bcast
+bandwidth by the number of concurrent broadcasters.
+
+Measured on 16× ND H100 v5, 1.2 TB / 6 files (single rail):
+
+| `--shard-size` | shards | DL Gb/s | Bcast Gb/s | speedup vs legacy |
+|---|---|---|---|---|
+| `0` (legacy) | 6 | 137 | 43.8 | 1.00× |
+| `32GiB` | 42 | 197 | 114.5 | 2.61× |
+| `16GiB` | 78 | 243 | 132.3 | 3.02× |
+| `8GiB` | 150 | 227 | 134.0 | 3.06× |
+| `2GiB` | 600 | 237 | 137.7 | 3.14× |
+
+The sweet spot is **8-16 GiB**: smaller shards add coordination overhead
+without buying more bandwidth, larger ones leave concurrency on the
+table. `--file-shards N` is the convenience form: `N` is the desired
+number of pieces of the largest file (e.g. `--file-shards 16` on a
+200 GiB file → ~12.5 GiB shards, rounded up to a `--bcast-chunk`
+multiple).
+
+Constraints:
+
+- `--shard-size % --bcast-chunk == 0` is enforced (so `O_DIRECT` padding
+  never straddles shard boundaries; only each file's final chunk needs
+  trim).
+- `--shard-size` and `--file-shards` are mutually exclusive.
+- `--shard-size 0` reproduces v0.3.1 behaviour exactly (validated against
+  baseline: 43.8 Gb/s vs historical 42.5 Gb/s, within noise).
+
+Range sharding also accelerates the **download** stage: more
+independent units of work give the LIST→GET pipeline more to chew on
+(137 → 243 Gb/s in the table above).
+
+### `--bcast-chunk` and `--bcast-pipeline`
 
 - `--bcast-chunk` — too small and you pay MPI per-message overhead per
   chunk; too large and you serialize the bcast (no overlap with the next
   chunk). 64 MiB is the default. On RDMA fabrics with deep queues we've
   measured improvements at 256 MiB; on TCP, smaller chunks (16 MiB) are
   often better.
-- `--bcast-pipeline` — number of chunks per file in flight. 4 is the
-  default. With RDMA, 8 has measurably better pipelining; on TCP 2 is
-  usually the right answer (more in-flight chunks just causes head-of-line
-  blocking on the single TCP connection per pair).
-
-For first-run tuning, start with the defaults and the `[bcast] BW` line
-is your scoreboard. See [cluster-benchmarks.md](cluster-benchmarks.md) for
-empirical sweep results.
+- `--bcast-pipeline` — number of chunks per file in flight. 1 is the
+  default. With RDMA, 4-8 has measurably better pipelining; on TCP 1-2 is
+  usually right (more in-flight chunks just causes head-of-line blocking
+  on the single TCP connection per pair).
 
 ### Throughput limits
 
@@ -219,6 +291,9 @@ want a cold-cache baseline measurement.
   (primary) and Apptainer (alt).
 - [cluster-benchmarks.md](cluster-benchmarks.md) — measurement methodology
   and reference numbers.
+- [cluster-v0.4-shard-size-sweep.md](cluster-v0.4-shard-size-sweep.md) —
+  v0.4 `--shard-size` sweep on 16× ND H100 v5: 3× bcast bandwidth on
+  large-checkpoint workloads.
 - [cluster-h100-tuning.md](cluster-h100-tuning.md) — Azure ND H100 v5
   bring-up notes, hcoll/algorithm/NUMA tuning recipes.
 - [performance-tuning.md](performance-tuning.md) — single-node tuning

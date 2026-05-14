@@ -22,10 +22,12 @@ which is the whole point of the tool.
 
 | Flag | Default | What it does |
 |---|---|---|
+| `--shard-size` | `0` | Range-shard each file into byte ranges of this size before assigning owners. `0` = one shard per file (legacy). With **fewer files than ranks** (typical of LLM checkpoints) this multiplies bcast bandwidth by the number of broadcasters per file. See [cluster-v0.4-shard-size-sweep.md](cluster-v0.4-shard-size-sweep.md) for a 3× win on 16× ND H100 v5. Must be a multiple of `--bcast-chunk`. |
+| `--file-shards` | (off) | Convenience: derive `--shard-size` as `ceil(max_file_size / N)` chunk-aligned. Mutex with `--shard-size`. |
 | `--bcast-chunk` | `64M` | MPI message size per `MPI_Ibcast`. Larger → fewer collectives, deeper pipeline buffer. |
-| `--bcast-pipeline` | `4` | Number of in-flight `MPI_Ibcast`s per file. Larger → better fabric overlap, more memory. |
-| `--bcast-writers` | `2` | Writer threads per rank for received chunks. `1` serializes writes; `2+` parallelises across the pipeline. |
-| `--bcast-direct` | `true` | Open destination files with `O_DIRECT` (4 KiB-aligned, bypasses page cache). On NVMe, lifts single-thread write ceiling from ~47 Gb/s to ~100 Gb/s. |
+| `--bcast-pipeline` | `1` | Number of in-flight `MPI_Ibcast`s per file. Larger → better fabric overlap, more memory. Defaults to 1 (TCP-friendly); raise to 4-8 on RDMA. |
+| `--bcast-writers` | `2` | Writer threads per rank for received chunks. `1` serializes writes; `2+` parallelises across the pipeline. With `--shard-size > 0`, often want 4-8. |
+| `--bcast-direct` | `true` | Open destination files with `O_DIRECT` (4 KiB-aligned, bypasses page cache). On NVMe, lifts single-thread write ceiling from ~47 Gb/s to ~100 Gb/s. Disable with `--no-bcast-direct`. |
 | `--verify` | `off` | After bcast, MD5 each file on every rank, MPI-Allgather, fail if any rank disagrees. Adds ~25-30 s on this dataset. |
 | `--compare` | `size` | Skip files already present at the right size. `none` forces every byte to transfer. |
 
@@ -49,7 +51,7 @@ bottleneck — see the dedicated tuning notes in
 - **Destination**: per-node NVMe at `/mnt/nvme/dataset` (4-way RAID-0 of
   `Microsoft NVMe Direct Disk v2`, ext4, `noatime,discard,stripe=512`).
   `tmpfs` rows use `emptyDir: {medium: Memory}` with 720 GiB pod limit.
-- **Software**: `azcp-cluster` ≥ v0.3.1 container, Open MPI 4.x + UCX
+- **Software**: `azcp-cluster` ≥ v0.4.0 container, Open MPI 4.x + UCX
   bundled. Run via StatefulSet on AKS with `hostNetwork: true`,
   `IPC_LOCK`, `rdma/ib: 4`.
 - **mpirun env (RDMA)**:
@@ -124,7 +126,7 @@ Example (the row-2 default above):
 
 ```bash
 SOURCE_URL='https://acct.blob.core.windows.net/models/llama/' \
-IMAGE='ghcr.io/edwardsp/azcp/azcp-cluster:v0.3.1' \
+IMAGE='ghcr.io/edwardsp/azcp/azcp-cluster:v0.4.0' \
 AZURE_CLIENT_ID='<workload-identity-client-id>' \
 NODEPOOL=gb300 REPLICAS=16 REPS=3 \
 CONFIGS='rdma-512m-pipe16;536870912;16;rc,sm,self' \

@@ -2,7 +2,7 @@ name: cluster-image
 
 on:
   push:
-    branches: [main, master, "feat/range-sharding"]
+    branches: [main, master]
     tags: ["v*"]
     paths:
       - "Dockerfile.cluster"

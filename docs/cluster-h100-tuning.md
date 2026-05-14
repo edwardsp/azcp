@@ -15,7 +15,7 @@ The workload starts at **75 Gb/s broadcast / 77 s wall-clock**. With three tunin
 | **NUMA layout** | NUMA 0 = CPUs 0-47, IB devices `mlx5_ib0..3`, **frontend (Azure) NIC**. NUMA 1 = CPUs 48-95, IB devices `mlx5_ib4..7` |
 | **Cluster size** | 16 nodes |
 | **Scheduler** | Slurm (Azure CycleCloud Workspace for Slurm), pyxis + enroot |
-| **Container image** | `ghcr.io/edwardsp/azcp/azcp-cluster:v0.3.1` (Open MPI 4.1.6 + UCX 1.15) |
+| **Container image** | `ghcr.io/edwardsp/azcp/azcp-cluster:v0.4.0` (Open MPI 4.1.6 + UCX 1.15) |
 | **Region / fabric** | `eastus`, NDR InfiniBand |
 
 The cluster used for these measurements was provisioned with
@@ -47,6 +47,16 @@ azcp-cluster <src> <dst> \
   --bcast-chunk 67108864 --bcast-pipeline 128 --bcast-writers 8 \
   --concurrency 32 --block-size 16777216 --no-progress
 ```
+
+> **For few-large-file workloads** (e.g. LLM checkpoints with ≤ N
+> files and ≥ 16 GiB each), the legacy single-broadcaster-per-file
+> plan caps bcast at ~44 Gb/s on this SKU. Add `--shard-size 8GiB`
+> to range-shard each file across multiple owners and lift bcast to
+> ~134 Gb/s — see
+> [cluster-v0.4-shard-size-sweep.md](cluster-v0.4-shard-size-sweep.md).
+> The 524-file DeepSeek workload above doesn't benefit from this
+> (already plenty of parallel broadcasters), so the recipe is left
+> unchanged.
 
 ---
 

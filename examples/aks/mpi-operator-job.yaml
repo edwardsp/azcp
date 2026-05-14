@@ -40,7 +40,7 @@ spec:
           restartPolicy: OnFailure
           containers:
             - name: launcher
-              image: ghcr.io/edwardsp/azcp/azcp-cluster:v0.3.1
+              image: ghcr.io/edwardsp/azcp/azcp-cluster:v0.4.0
               imagePullPolicy: IfNotPresent
               env:
                 - name: SOURCE_URL
@@ -107,7 +107,7 @@ spec:
                   topologyKey: kubernetes.io/hostname
           containers:
             - name: worker
-              image: ghcr.io/edwardsp/azcp/azcp-cluster:v0.3.1
+              image: ghcr.io/edwardsp/azcp/azcp-cluster:v0.4.0
               imagePullPolicy: IfNotPresent
               env:
                 - name: AZURE_CLIENT_ID
