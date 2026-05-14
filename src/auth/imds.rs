@@ -53,6 +53,7 @@ pub fn get_storage_token_workload() -> Result<Option<String>, AzcpError> {
     ];
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(10))
+        .user_agent(crate::USER_AGENT)
         .build()
         .map_err(|e| AzcpError::Auth(format!("http client: {e}")))?;
     let resp = client
@@ -88,6 +89,7 @@ pub fn get_storage_token_imds() -> Result<Option<String>, AzcpError> {
     }
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(3))
+        .user_agent(crate::USER_AGENT)
         .build()
         .map_err(|e| AzcpError::Auth(format!("http client: {e}")))?;
     let resp = match client.get(&url).header("Metadata", "true").send() {

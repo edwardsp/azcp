@@ -156,6 +156,7 @@ impl BlobClient {
         let http = Client::builder()
             .pool_max_idle_per_host(512)
             .http1_only()
+            .user_agent(crate::USER_AGENT)
             .build()
             .map_err(AzcpError::Http)?;
         Ok(Self {
