@@ -33,7 +33,7 @@ writable):
 ```bash
 # See examples/slurm/enroot-import.sh for a complete script.
 enroot import -o /shared/images/azcp-cluster.sqsh \
-  docker://ghcr.io#edwardsp/azcp/azcp-cluster:v0.4.0
+  docker://ghcr.io#edwardsp/azcp/azcp-cluster:v0.4.2
 ```
 
 This produces a `~250 MiB` squashed image. Re-import when you bump
@@ -110,7 +110,7 @@ plugin layer.
 
 ```bash
 apptainer build /shared/images/azcp-cluster.sif \
-  docker://ghcr.io/edwardsp/azcp/azcp-cluster:v0.4.0
+  docker://ghcr.io/edwardsp/azcp/azcp-cluster:v0.4.2
 ```
 
 This is slower than `enroot import` (Apptainer rebuilds an mksquashfs

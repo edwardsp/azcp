@@ -1,6 +1,6 @@
 [package]
 name = "azcp"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 description = "A Rust implementation of Azure Storage data transfer (azcopy)"
 

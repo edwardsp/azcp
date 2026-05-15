@@ -13,7 +13,7 @@
 #
 # One-time image build (run on a login node):
 #   apptainer build /shared/images/azcp-cluster.sif \
-#     docker://ghcr.io/edwardsp/azcp/azcp-cluster:v0.4.0
+#     docker://ghcr.io/edwardsp/azcp/azcp-cluster:v0.4.2
 #
 # Edit before submitting:
 #   - --nodes

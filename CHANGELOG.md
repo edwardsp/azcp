@@ -5,6 +5,126 @@ All notable changes to `azcp` and `azcp-cluster` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.4.2] — 2026-05
+
+Operational visibility for `azcp-cluster` retries: live per-rank counters
+already worked when stderr was a TTY, but Slurm / CI / `kubectl logs`
+runs silenced the progress bar and made retry pressure invisible. This
+release adds an end-of-run summary line on rank 0 and a long-form
+operator guide for sizing the throttling knobs.
+
+### Added
+
+#### `azcp-cluster`
+
+- **MPI-reduced retry summary on rank 0.** At the end of the `[download]`
+  stage, all downloaders `MPI_Reduce` their four retry counters
+  (`503`, `429`, other `5xx`, transport errors) and rank 0 prints a
+  single line, e.g.
+
+  ```
+  [cluster] retries: 503x842 429x14 across 16 downloaders
+  ```
+
+  Omitted entirely when no rank saw any retry, so the line's presence
+  alone signals Azure pushed back during the run. Categories shown
+  only when non-zero.
+
+### Documentation
+
+- **`docs/handling-throttling.md`** — new long-form operator guide for
+  the three knobs that govern `azcp-cluster` behaviour against Azure
+  Storage account quotas: `--download-ranks K`, `--max-bandwidth RATE`,
+  `--max-retries N`. Includes the cost math for high retry budgets
+  (5/10/30 retries → +35%/3.4×/17× worst-case latency at 1 TiB on a
+  200 Gbps account), the `Retry-After` honoring rules, and a single
+  recipe anchored on the v0.4 sweep (16 × ND H100 v5 → 237 Gb/s with
+  `--shard-size 2GiB`).
+
+### Notes
+
+No CLI flag changes. Existing scripts and manifests work unchanged.
+New images: `ghcr.io/edwardsp/azcp/azcp-cluster:v0.4.2` and `:latest`.
+
+## [v0.4.1] — 2026-05
+
+Identifiable HTTP traffic and macOS CI stabilization. No behavioural
+changes for users; the only on-the-wire difference is the User-Agent
+header.
+
+### Added
+
+- **`User-Agent: azcp/<version>`** on every outbound HTTP request —
+  blob REST calls (`BlobClient`), IMDS managed-identity probes, and
+  workload-identity federated-token exchanges. Lets storage accounts
+  and proxies attribute traffic without packet capture, and surfaces
+  the exact client version in Azure Storage Analytics logs.
+
+### Fixed
+
+- **macOS CI stable on Apple Silicon runners.** `aarch64-apple-darwin`
+  is now pinned to `macos-14` (stable arm64) and `x86_64-apple-darwin`
+  cross-compiles on `macos-14` instead of the deprecated Intel
+  `macos-13` runner. Both targets ship in the release archive.
+
+### Notes
+
+New images: `ghcr.io/edwardsp/azcp/azcp-cluster:v0.4.1` and `:latest`.
+
+## [v0.4.0] — 2026-05
+
+Range-sharding for `azcp-cluster`: when a dataset has fewer large files
+than downloaders, the previous file-level partition left some ranks
+idle. This release splits files into byte ranges across downloaders and
+broadcasts them in parallel, lifting the floor on small-file-count
+workloads.
+
+### Added
+
+#### `azcp-cluster`
+
+- **Range-sharding with `--shard-size BYTES`** (default `2GiB`). Files
+  are split into shards of at most `--shard-size` bytes; downloaders
+  pull contiguous byte ranges via HTTP `Range:` requests and write
+  with positional `pwrite` so any rank can write any offset of any
+  file. With K downloaders and a single 50 GiB blob, all K ranks
+  contribute Azure egress instead of one.
+- **Parallel-file broadcast with `--file-shards N`.** Up to N files
+  are bcast concurrently across the cluster, removing the per-file
+  serialization that capped multi-GiB-file workloads. The owner-side
+  pipeline now interleaves chunks from the active set.
+- **`ShardSpec` plan plumbing.** A `[shard]` line per rank reports its
+  byte assignment so distributed launches can debug imbalance directly
+  from logs.
+
+### Performance
+
+- **1 TiB / 6-file H100 cluster sweep.** On 16 × ND H100 v5, a 6-file
+  1 TiB checkpoint reaches **237 Gb/s** end-to-end download with
+  `--shard-size 2GiB --download-ranks 16` versus a previous floor of
+  ~62 Gb/s when only 6 of 16 ranks could contribute egress. Full
+  sweep in [docs/cluster-v0.4-shard-size-sweep.md](docs/cluster-v0.4-shard-size-sweep.md).
+
+### Documentation
+
+- **524-blob DeepSeek sweep** added to `docs/cluster-benchmarks.md` —
+  shows that range-sharding is a no-op (and slight overhead) when
+  fan-out is already saturated by file count, validating `--shard-size`
+  as a "fix the floor, don't change the ceiling" knob.
+
+### Fixed
+
+- **CI**: `x86_64-apple-darwin` pinned to the Intel `macos-13` runner
+  for the v0.4.0 cut (later updated to cross-compile from arm64 in
+  v0.4.1 once GitHub deprecated `macos-13`).
+
+### Notes
+
+`--shard-size 2GiB` is the new default. Previous file-only behaviour
+is recoverable with `--shard-size 0` (one shard per file) but not
+recommended. New images: `ghcr.io/edwardsp/azcp/azcp-cluster:v0.4.0`
+and `:latest`.
+
 ## [v0.3.1] — 2026-05
 
 Three independent correctness fixes shaken out by a 16× ND_H100_v5
