@@ -58,7 +58,7 @@ srun --mpi=pmix --export=$EXP \
        [--parallel-files $PF] \
        [--max-bandwidth $BW] \
        --block-size 16MiB \
-       --bcast-chunk 4GiB \
+       --bcast-chunk 1GiB \
        --bcast-pipeline 128 \
        --bcast-writers 8 \
        --no-progress
@@ -78,7 +78,7 @@ Both the frontend NIC (blob downloads) and the chosen IB rail
 enforces first-touch memory locality at the Slurm level without
 requiring `numactl` inside the container.
 
-`--block-size 16MiB` / `--bcast-chunk 4GiB` / `--bcast-pipeline 128`
+`--block-size 16MiB` / `--bcast-chunk 1GiB` / `--bcast-pipeline 128`
 / `--bcast-writers 8` are the v0.3.1 6-file winners
 ([table](azcp-cluster-1tb-6file-sweep.md#results)) and were held
 constant across the v0.4.2 throttling sweep so any retry / DL-Gb/s
@@ -208,7 +208,7 @@ srun --mpi=pmix --export=$EXP \
        --max-bandwidth 200Gbps \
        --max-retries 15 \
        --block-size 16MiB \
-       --bcast-chunk 4GiB \
+       --bcast-chunk 1GiB \
        --bcast-pipeline 128 \
        --bcast-writers 8 \
        --no-progress

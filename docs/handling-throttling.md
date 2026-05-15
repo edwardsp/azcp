@@ -306,7 +306,7 @@ srun --mpi=pmix azcp-cluster download <src> <dst> \
   --max-bandwidth 200Gbps \
   --max-retries 15 \
   --block-size 16MiB \
-  --bcast-chunk 4GiB \
+  --bcast-chunk 1GiB \
   --bcast-pipeline 128 \
   --bcast-writers 8 \
   --no-progress
@@ -317,7 +317,7 @@ the bcast / progress tuning carried over unchanged from the v0.3.x
 1.2 TB / 6-file sweep
 ([docs/azcp-cluster-1tb-6file-sweep.md](azcp-cluster-1tb-6file-sweep.md))
 where they were established as the few-large-files winners
-(`--block-size 16MiB`, `--bcast-chunk 4GiB`, `--bcast-pipeline 128`,
+(`--block-size 16MiB`, `--bcast-chunk 1GiB`, `--bcast-pipeline 128`,
 `--bcast-writers 8`). Use the same scaffolding `srun` flags as in
 that sweep (UCX env, `--mem-bind=local`, `taskset -c 0-47` NUMA pin,
 container mounts) — full block in
