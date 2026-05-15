@@ -19,8 +19,8 @@ envelope where Azure Blob returns `503 ServerBusy` /
 `OperationTimedOut` and how the available knobs (`--concurrency`,
 `--parallel-files`, `--max-bandwidth`) interact with that envelope.
 
-All runs use range-sharding (`--shard-size 2147483648`, 2 GiB) except
-the no-shard defaults baseline.
+All runs use range-sharding (`--shard-size 2GiB`) except the no-shard
+defaults baseline.
 
 ## Workload A — `--concurrency` sweep
 
@@ -117,13 +117,13 @@ storage account:
 
 ```bash
 srun --mpi=pmix azcp-cluster download <src> <dst> \
-  --shard-size 2147483648 \
+  --shard-size 2GiB \
   --concurrency 64 \
   --max-bandwidth 200Gbps
 ```
 
 If `--max-bandwidth` is unavailable (older clients), fall back to
-`--shard-size 2147483648 --concurrency 32` (177 Gb/s, 0 retries,
+`--shard-size 2GiB --concurrency 32` (177 Gb/s, 0 retries,
 +10 s wall vs the capped C64 recipe).
 
 See [docs/handling-throttling.md](handling-throttling.md) for the
