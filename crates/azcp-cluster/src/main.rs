@@ -308,14 +308,20 @@ fn main() -> ExitCode {
         my_bytes
     );
 
+    let mut rank_retry_summary = stages::download::RankRetrySummary::default();
     let t_download = if matches!(args.stage, Stage::Bcast) || !is_downloader {
         0.0
     } else {
         let t0 = environment::time();
-        if let Err(err) = stages::download::run(&args, my_ranges.clone(), per_rank_bandwidth) {
-            eprintln!("rank {rank}: download stage failed: {err:#}");
-            unsafe { ffi::MPI_Abort(world.as_raw(), 5) };
-            return ExitCode::from(5);
+        match stages::download::run(&args, my_ranges.clone(), per_rank_bandwidth) {
+            Ok(s) => {
+                rank_retry_summary = s;
+            }
+            Err(err) => {
+                eprintln!("rank {rank}: download stage failed: {err:#}");
+                unsafe { ffi::MPI_Abort(world.as_raw(), 5) };
+                return ExitCode::from(5);
+            }
         }
         environment::time() - t0
     };
@@ -327,6 +333,7 @@ fn main() -> ExitCode {
             timing::human_bw(download_bytes, t_download)
         );
     }
+    print_cluster_retry_summary(&world, rank, download_rank_count, &rank_retry_summary);
     if matches!(args.stage, Stage::Download) {
         return ExitCode::SUCCESS;
     }
@@ -390,6 +397,62 @@ fn main() -> ExitCode {
     }
 
     ExitCode::SUCCESS
+}
+
+/// Reduce per-rank retry counters to rank 0 and print a single
+/// cluster-wide summary line. Cheap: 4 × u64 across `download_rank_count`
+/// ranks (non-downloaders contribute zeros). Silenced when no rank saw
+/// any retry, so the line only appears when something actually happened.
+fn print_cluster_retry_summary(
+    world: &mpi::topology::SimpleCommunicator,
+    rank: i32,
+    download_rank_count: usize,
+    s: &stages::download::RankRetrySummary,
+) {
+    let send: [u64; 4] = [s.throttle_503, s.throttle_429, s.server_5xx, s.transport_err];
+    let mut recv: [u64; 4] = [0; 4];
+    let rc = unsafe {
+        ffi::MPI_Reduce(
+            send.as_ptr() as *const std::ffi::c_void,
+            recv.as_mut_ptr() as *mut std::ffi::c_void,
+            4,
+            ffi::RSMPI_UINT64_T,
+            ffi::RSMPI_SUM,
+            0,
+            world.as_raw(),
+        )
+    };
+    if rc != ffi::MPI_SUCCESS as i32 {
+        if rank == 0 {
+            eprintln!("[cluster] retry summary MPI_Reduce failed: rc={rc}");
+        }
+        return;
+    }
+    if rank != 0 {
+        return;
+    }
+    let total: u64 = recv.iter().sum();
+    if total == 0 {
+        return;
+    }
+    let mut parts: Vec<String> = Vec::with_capacity(4);
+    if recv[0] > 0 {
+        parts.push(format!("503x{}", recv[0]));
+    }
+    if recv[1] > 0 {
+        parts.push(format!("429x{}", recv[1]));
+    }
+    if recv[2] > 0 {
+        parts.push(format!("5xxx{}", recv[2]));
+    }
+    if recv[3] > 0 {
+        parts.push(format!("transport-errx{}", recv[3]));
+    }
+    println!(
+        "[cluster] retries: {} across {} downloaders",
+        parts.join(" "),
+        download_rank_count
+    );
 }
 
 fn hostname() -> String {

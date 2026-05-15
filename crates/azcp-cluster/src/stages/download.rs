@@ -1,3 +1,4 @@
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
@@ -8,9 +9,25 @@ use azcp::{
 
 use crate::cli::Args;
 
-pub fn run(args: &Args, my_ranges: Vec<DownloadRange>, max_bandwidth: Option<u64>) -> Result<()> {
+/// Per-rank counters returned to the orchestrator so rank 0 can MPI_Reduce
+/// them into a cluster-wide retry summary. Mirrors the four atomics in
+/// `azcp::storage::blob::client::RetryStats` so we don't leak that type
+/// across the crate boundary.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RankRetrySummary {
+    pub throttle_503: u64,
+    pub throttle_429: u64,
+    pub server_5xx: u64,
+    pub transport_err: u64,
+}
+
+pub fn run(
+    args: &Args,
+    my_ranges: Vec<DownloadRange>,
+    max_bandwidth: Option<u64>,
+) -> Result<RankRetrySummary> {
     if my_ranges.is_empty() {
-        return Ok(());
+        return Ok(RankRetrySummary::default());
     }
     let loc = parse_location(&args.source)
         .map_err(|e| anyhow!("failed to parse source {}: {e}", args.source))?;
@@ -27,6 +44,7 @@ pub fn run(args: &Args, my_ranges: Vec<DownloadRange>, max_bandwidth: Option<u64
         .map_err(|e| anyhow!("failed to resolve credentials for {}: {e}", blob.account))?;
     let client =
         BlobClient::new(credential).map_err(|e| anyhow!("failed to construct BlobClient: {e}"))?;
+    let retry_stats = client.retry_stats();
 
     let config = TransferConfig {
         block_size: args.block_size as u64,
@@ -67,5 +85,10 @@ pub fn run(args: &Args, my_ranges: Vec<DownloadRange>, max_bandwidth: Option<u64
             summary.total_files
         ));
     }
-    Ok(())
+    Ok(RankRetrySummary {
+        throttle_503: retry_stats.throttle_503.load(Ordering::Relaxed),
+        throttle_429: retry_stats.throttle_429.load(Ordering::Relaxed),
+        server_5xx: retry_stats.server_5xx.load(Ordering::Relaxed),
+        transport_err: retry_stats.transport_err.load(Ordering::Relaxed),
+    })
 }

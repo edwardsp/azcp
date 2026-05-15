@@ -161,8 +161,9 @@ Default: **5**. Environment variable: `AZCP_MAX_RETRIES`.
 
 Raises the per-block retry budget. Use it to **guarantee** a download
 completes through bursty throttling — but always pair with
-`--download-ranks` and watch the retry counters in the progress bar
-(see "Backoff" below for the live `[retry 503x12 429x2]` indicator). If
+`--download-ranks` and watch the retry counters (live per-rank in the
+progress bar when stderr is a TTY, or the end-of-run `[cluster] retries:
+…` summary on rank 0 in non-TTY runs — see "Backoff" §3 below). If
 those numbers are climbing, you're submitting too much load — fix the
 load first, then trust retries to handle the residual jitter.
 
@@ -259,8 +260,8 @@ Knob 3.
 
 ### 3. Live retry counters
 
-When progress display is active, the total bar suffix shows live
-counters, e.g.
+When progress display is active, every downloader's progress bar suffix
+shows that rank's live counters, e.g.
 
 ```
 [retry 503x12 429x2]
@@ -269,6 +270,19 @@ counters, e.g.
 If those numbers are climbing during a run, **stop the job and lower
 `--download-ranks` or `--max-bandwidth`.** Don't just let retries soak
 it up — see the cost math above.
+
+In Slurm / CI / `kubectl logs` runs where stderr isn't a TTY the live
+bars are silenced automatically. For those, `azcp-cluster` prints a
+single MPI-reduced summary line on rank 0 at end of the download stage:
+
+```
+[cluster] retries: 503x842 429x14 across 16 downloaders
+```
+
+The line is omitted when no rank saw any retry, so its presence alone
+means Azure pushed back during the run. Categories shown only when
+non-zero: `503xN` (ServerBusy), `429xN` (Too Many Requests), `5xxxN`
+(other transient 5xx), `transport-errxN` (connection / timeout).
 
 If a transfer ultimately fails after exhausting retries, `azcp-cluster`
 exits non-zero and prints a `Failed: N` summary.
@@ -294,8 +308,9 @@ dataset has few large files (see Knob 2 caveat).
 Scale `--download-ranks` and `--max-bandwidth` together if you have a
 higher account quota and VMs with sufficient NIC bandwidth — the
 relationship between K and quota is roughly linear in the regime we've
-measured. If you're not sure, start at K = 16 and watch the live retry
-counters.
+measured. If you're not sure, start at K = 16 and watch the retry
+counters (live in the progress bar, or the rank-0 `[cluster] retries:`
+summary in Slurm/CI runs).
 
 ---
 
