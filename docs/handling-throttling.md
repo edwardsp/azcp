@@ -291,19 +291,31 @@ exits non-zero and prints a `Failed: N` summary.
 
 ## Recipe
 
-Anchored on the v0.4 sweep: 16 × ND H100 v5 nodes saturating a standard
-200 Gbps account.
+Anchored on the v0.4.2 throttling sweep: 16 × ND H100 v5 nodes
+against a single same-region standard account, where the 200 Gb/s
+ingress soft limit is a **hard cliff** (177 Gb/s @ `--concurrency 32`
+→ 0 retries; 262 Gb/s @ `--concurrency 64` → 3 347 retries). Capping
+bandwidth at the threshold eliminates all retries with **no
+wall-clock penalty**. Full data:
+[docs/cluster-v0.4.2-throttling-sweep.md](cluster-v0.4.2-throttling-sweep.md).
 
 ```bash
 srun --mpi=pmix azcp-cluster download <src> <dst> \
-  --download-ranks 16 \
+  --shard-size 2GiB \
+  --concurrency 64 \
   --max-bandwidth 200Gbps \
-  --max-retries 15 \
-  --shard-size 2GiB
+  --max-retries 15
 ```
 
 `--shard-size 2GiB` ensures all 16 downloaders have work even when the
-dataset has few large files (see Knob 2 caveat).
+dataset has few large files (see Knob 2 caveat). `--concurrency 64`
+sizes per-rank in-flight requests for the worst case; `--max-bandwidth
+200Gbps` protects the storage account from 503s without slowing the
+run down.
+
+If `--max-bandwidth` is unavailable (older client), fall back to
+`--shard-size 2GiB --concurrency 32` — same 0 retries, ~10 s slower
+on a 1.2 TB workload.
 
 Scale `--download-ranks` and `--max-bandwidth` together if you have a
 higher account quota and VMs with sufficient NIC bandwidth — the
