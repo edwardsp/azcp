@@ -304,8 +304,24 @@ srun --mpi=pmix azcp-cluster download <src> <dst> \
   --shard-size 2GiB \
   --concurrency 64 \
   --max-bandwidth 200Gbps \
-  --max-retries 15
+  --max-retries 15 \
+  --block-size 16MiB \
+  --bcast-chunk 4GiB \
+  --bcast-pipeline 128 \
+  --bcast-writers 8 \
+  --no-progress
 ```
+
+The first four flags are the throttling controls. The last five are
+the bcast / progress tuning carried over unchanged from the v0.3.x
+1.2 TB / 6-file sweep
+([docs/azcp-cluster-1tb-6file-sweep.md](azcp-cluster-1tb-6file-sweep.md))
+where they were established as the few-large-files winners
+(`--block-size 16MiB`, `--bcast-chunk 4GiB`, `--bcast-pipeline 128`,
+`--bcast-writers 8`). Use the same scaffolding `srun` flags as in
+that sweep (UCX env, `--mem-bind=local`, `taskset -c 0-47` NUMA pin,
+container mounts) — full block in
+[docs/cluster-v0.4.2-throttling-sweep.md § Constant configuration](cluster-v0.4.2-throttling-sweep.md#constant-configuration).
 
 `--shard-size 2GiB` ensures all 16 downloaders have work even when the
 dataset has few large files (see Knob 2 caveat). `--concurrency 64`

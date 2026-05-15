@@ -22,6 +22,71 @@ envelope where Azure Blob returns `503 ServerBusy` /
 All runs use range-sharding (`--shard-size 2GiB`) except the no-shard
 defaults baseline.
 
+## Constant configuration
+
+Carried over from the v0.3.x 1.2 TB / 6-file sweep
+([docs/azcp-cluster-1tb-6file-sweep.md](azcp-cluster-1tb-6file-sweep.md)),
+which established the NUMA-pin + UCX env + bcast tuning that maximises
+download and broadcast on this cluster shape. The v0.4.2 sweep
+re-uses every one of those settings unchanged and varies only
+`--concurrency`, `--parallel-files`, `--max-bandwidth`, and
+`--shard-size`.
+
+```bash
+#SBATCH --exclusive
+#SBATCH --nodes=16
+#SBATCH --ntasks-per-node=1
+
+export UCX_TLS=rc,sm,self
+export UCX_NET_DEVICES=mlx5_ib0:1
+export OMPI_MCA_pml=ucx
+export OMPI_MCA_osc=ucx
+export OMPI_MCA_coll_libnbc_ibcast_algorithm=1   # 1 = linear (winner from algsweep2)
+export AZURE_CLIENT_ID=<workload-identity-mi-client-id>
+
+EXP=ALL,UCX_TLS,UCX_NET_DEVICES,OMPI_MCA_pml,OMPI_MCA_osc,OMPI_MCA_coll_libnbc_ibcast_algorithm,AZURE_CLIENT_ID
+
+srun --mpi=pmix --export=$EXP \
+     --mem-bind=local \
+     --container-image=/shared/images/azcp-cluster-v0.4.2.sqsh \
+     --container-mounts=/dev/infiniband:/dev/infiniband,/nvme:/nvme \
+     --container-writable \
+     taskset -c 0-47 \
+     azcp-cluster <SOURCE_URL> /nvme/perftest-dst \
+       --shard-size 2GiB \
+       --concurrency $C \
+       [--parallel-files $PF] \
+       [--max-bandwidth $BW] \
+       --block-size 16MiB \
+       --bcast-chunk 4GiB \
+       --bcast-pipeline 128 \
+       --bcast-writers 8 \
+       --no-progress
+```
+
+NUMA layout on `Standard_ND96isr_H100_v5`:
+
+```
+NUMA 0:  CPUs 0-47   | mlx5_ib0..3 | frontend Ethernet NIC (blob)
+NUMA 1:  CPUs 48-95  | mlx5_ib4..7 | (unused this run)
+NVMe (md0): NUMA 1   (cross-NUMA write — PCIe NVMe ≫ 200 Gbps frontend cap, tolerable)
+```
+
+Both the frontend NIC (blob downloads) and the chosen IB rail
+(`mlx5_ib0`, MPI broadcast) live on NUMA 0, so a single `taskset -c
+0-47` pins both DMA paths to local memory. `srun --mem-bind=local`
+enforces first-touch memory locality at the Slurm level without
+requiring `numactl` inside the container.
+
+`--block-size 16MiB` / `--bcast-chunk 4GiB` / `--bcast-pipeline 128`
+/ `--bcast-writers 8` are the v0.3.1 6-file winners
+([table](azcp-cluster-1tb-6file-sweep.md#results)) and were held
+constant across the v0.4.2 throttling sweep so any retry / DL-Gb/s
+delta is attributable to the knob under test, not to bcast tuning.
+
+Per-row deltas from this constant base are shown in the three
+workload tables below.
+
 ## Workload A — `--concurrency` sweep
 
 `--concurrency` = HTTP requests in flight per active downloader rank.
@@ -112,19 +177,49 @@ the 200 Gbps ceiling, confirming the limiter works as advertised.
 
 ## Recommended production configuration
 
-For 1.2 TB / few-large-files on 16× H100 against a single same-region
-storage account:
+For 1.2 TB / few-large-files on 16× ND H100 v5 against a single
+same-region standard storage account, with the v0.3.x bcast tuning
+held constant from the [Constant configuration](#constant-configuration)
+above:
 
 ```bash
-srun --mpi=pmix azcp-cluster download <src> <dst> \
-  --shard-size 2GiB \
-  --concurrency 64 \
-  --max-bandwidth 200Gbps
+#SBATCH --exclusive
+#SBATCH --nodes=16
+#SBATCH --ntasks-per-node=1
+
+export UCX_TLS=rc,sm,self
+export UCX_NET_DEVICES=mlx5_ib0:1
+export OMPI_MCA_pml=ucx
+export OMPI_MCA_osc=ucx
+export OMPI_MCA_coll_libnbc_ibcast_algorithm=1
+export AZURE_CLIENT_ID=<workload-identity-mi-client-id>
+
+EXP=ALL,UCX_TLS,UCX_NET_DEVICES,OMPI_MCA_pml,OMPI_MCA_osc,OMPI_MCA_coll_libnbc_ibcast_algorithm,AZURE_CLIENT_ID
+
+srun --mpi=pmix --export=$EXP \
+     --mem-bind=local \
+     --container-image=/shared/images/azcp-cluster-v0.4.2.sqsh \
+     --container-mounts=/dev/infiniband:/dev/infiniband,/nvme:/nvme \
+     --container-writable \
+     taskset -c 0-47 \
+     azcp-cluster <SOURCE_URL> /nvme/dataset \
+       --shard-size 2GiB \
+       --concurrency 64 \
+       --max-bandwidth 200Gbps \
+       --max-retries 15 \
+       --block-size 16MiB \
+       --bcast-chunk 4GiB \
+       --bcast-pipeline 128 \
+       --bcast-writers 8 \
+       --no-progress
 ```
 
-If `--max-bandwidth` is unavailable (older clients), fall back to
-`--shard-size 2GiB --concurrency 32` (177 Gb/s, 0 retries,
-+10 s wall vs the capped C64 recipe).
+Expected: download ~196 Gb/s (capped at the 200 Gb/s account
+threshold), 0 retries, broadcast ~148 Gb/s, end-to-end ~122 s.
+
+If `--max-bandwidth` is unavailable (older client), drop that flag
+and lower `--concurrency 32` (177 Gb/s, 0 retries, +10 s wall vs the
+capped C64 recipe).
 
 See [docs/handling-throttling.md](handling-throttling.md) for the
 operator-facing guide that explains *why* these knobs interact this
