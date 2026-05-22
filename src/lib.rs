@@ -4,6 +4,9 @@ pub mod config;
 pub mod engine;
 pub mod error;
 pub mod storage;
+pub mod units;
+
+pub use units::parse_size;
 
 /// `User-Agent` header value sent on every outbound HTTP request
 /// (Azure Blob REST, IMDS, federated-token exchange). Kept as a

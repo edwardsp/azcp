@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use azcp::parse_size;
 use clap::{Parser, ValueEnum};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -140,51 +141,6 @@ pub struct Args {
     /// --bcast-chunk. Mutually exclusive with --shard-size.
     #[arg(long, value_name = "N")]
     pub file_shards: Option<usize>,
-}
-
-/// Parse a byte size with optional binary/decimal SI suffix.
-/// Accepts: bare bytes (`16777216`), decimal (`32MB`, `1GB`, `2TB`),
-/// binary (`32MiB`, `1GiB`, `2TiB`). Case-insensitive. The trailing
-/// `B` is optional (`32Gi`, `32G` both work as binary GiB / decimal GB
-/// respectively — same convention as `dd`).
-pub fn parse_size(s: &str) -> Result<u64, String> {
-    let raw = s.trim();
-    if raw.is_empty() {
-        return Err("empty size value".into());
-    }
-    let lower = raw.to_lowercase();
-    let split = lower
-        .find(|c: char| !c.is_ascii_digit() && c != '.')
-        .unwrap_or(lower.len());
-    let (num_str, unit) = lower.split_at(split);
-    if num_str.is_empty() {
-        return Err(format!(
-            "size must start with a number, got {s:?} (try e.g. 32GiB, 1GB, 16777216)"
-        ));
-    }
-    let num: f64 = num_str
-        .parse()
-        .map_err(|_| format!("bad size number {num_str:?} in {s:?}"))?;
-    if num < 0.0 || !num.is_finite() {
-        return Err(format!("size must be non-negative and finite, got {s:?}"));
-    }
-    let multiplier: f64 = match unit.trim() {
-        "" | "b" | "byte" | "bytes" => 1.0,
-        "k" | "kb" => 1_000.0,
-        "m" | "mb" => 1_000_000.0,
-        "g" | "gb" => 1_000_000_000.0,
-        "t" | "tb" => 1_000_000_000_000.0,
-        "ki" | "kib" => 1024.0,
-        "mi" | "mib" => 1024.0 * 1024.0,
-        "gi" | "gib" => 1024.0 * 1024.0 * 1024.0,
-        "ti" | "tib" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
-        other => {
-            return Err(format!(
-                "unknown size unit {other:?} in {s:?} (try GiB, MiB, GB, MB)"
-            ))
-        }
-    };
-    Ok((num * multiplier).round() as u64)
 }
 
 impl Args {

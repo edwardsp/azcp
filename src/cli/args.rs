@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 
+use crate::units::parse_size;
+
 // Resolve the three-state progress preference: explicit --no-progress wins,
 // then explicit --progress, otherwise auto-detect based on whether stderr is
 // attached to a terminal. Auto-detection avoids polluting redirected logs and
@@ -146,7 +148,13 @@ pub struct CopyArgs {
     #[arg(long, help = "Do not overwrite existing destination files")]
     pub no_overwrite: bool,
 
-    #[arg(long, default_value_t = 4_194_304)]
+    #[arg(
+        long,
+        default_value = "4MiB",
+        value_parser = parse_size,
+        help = "Block size for uploads/downloads. Accepts bytes, binary \
+                (`16MiB`), or decimal (`16MB`) units."
+    )]
     pub block_size: u64,
 
     #[arg(long, default_value_t = 64)]
@@ -240,7 +248,13 @@ pub struct SyncArgs {
     #[arg(long, default_value_t = 64)]
     pub concurrency: usize,
 
-    #[arg(long, default_value_t = 4_194_304)]
+    #[arg(
+        long,
+        default_value = "4MiB",
+        value_parser = parse_size,
+        help = "Block size for uploads/downloads. Accepts bytes, binary \
+                (`16MiB`), or decimal (`16MB`) units."
+    )]
     pub block_size: u64,
 
     #[arg(
