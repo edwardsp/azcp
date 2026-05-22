@@ -166,7 +166,7 @@ fn main() -> ExitCode {
     // Resolve effective shard_size: explicit --shard-size wins; else
     // derive from --file-shards over the largest downloaded file; else 0
     // (one shard per file, v0.3.1 plan shape).
-    let bcast_chunk_u64 = args.bcast_chunk as u64;
+    let bcast_chunk_u64 = args.bcast_chunk;
     let effective_shard_size: u64 = if args.shard_size > 0 {
         args.shard_size
     } else if let Some(n) = args.file_shards {

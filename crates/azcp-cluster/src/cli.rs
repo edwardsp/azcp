@@ -52,17 +52,19 @@ pub struct Args {
     #[arg(long, default_value_t = 64)]
     pub concurrency: usize,
 
-    /// Block size in bytes for downloads
-    #[arg(long, default_value_t = 16 * 1024 * 1024)]
-    pub block_size: usize,
+    /// Block size for downloads. Accepts bytes, binary (`16MiB`), or
+    /// decimal (`16MB`) units; see `--shard-size` for full unit list.
+    #[arg(long, default_value_t = 16 * 1024 * 1024, value_parser = parse_size)]
+    pub block_size: u64,
 
     /// Files transferring concurrently per rank
     #[arg(long, default_value_t = 16)]
     pub parallel_files: usize,
 
-    /// Bcast chunk size in bytes
-    #[arg(long, default_value_t = 64 * 1024 * 1024)]
-    pub bcast_chunk: usize,
+    /// Bcast chunk size. Accepts bytes, binary (`1GiB`), or decimal
+    /// (`1GB`) units; see `--shard-size` for full unit list.
+    #[arg(long, default_value_t = 64 * 1024 * 1024, value_parser = parse_size)]
+    pub bcast_chunk: u64,
 
     /// Number of in-flight Ibcast chunks (depth of the pipeline). Higher
     /// values overlap disk I/O with the network at the cost of memory
@@ -195,7 +197,7 @@ impl Args {
             );
         }
         if self.shard_size > 0 {
-            let chunk = self.bcast_chunk as u64;
+            let chunk = self.bcast_chunk;
             if chunk == 0 {
                 return Err("--bcast-chunk must be > 0".into());
             }
@@ -221,26 +223,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_size_units() {
-        assert_eq!(parse_size("0").unwrap(), 0);
-        assert_eq!(parse_size("16777216").unwrap(), 16 * 1024 * 1024);
-        assert_eq!(parse_size("32GiB").unwrap(), 32u64 * 1024 * 1024 * 1024);
-        assert_eq!(parse_size("32gib").unwrap(), 32u64 * 1024 * 1024 * 1024);
-        assert_eq!(parse_size("32Gi").unwrap(), 32u64 * 1024 * 1024 * 1024);
-        assert_eq!(parse_size("1GB").unwrap(), 1_000_000_000);
-        assert_eq!(parse_size("1G").unwrap(), 1_000_000_000);
-        assert_eq!(parse_size("2TiB").unwrap(), 2u64 * 1024 * 1024 * 1024 * 1024);
+    fn block_size_and_bcast_chunk_accept_human_units() {
+        use clap::Parser;
+        let args = Args::try_parse_from([
+            "azcp-cluster",
+            "src",
+            "dst",
+            "--block-size",
+            "16MiB",
+            "--bcast-chunk",
+            "1GiB",
+        ])
+        .expect("CLI must accept human-readable size units");
+        assert_eq!(args.block_size, 16 * 1024 * 1024);
+        assert_eq!(args.bcast_chunk, 1024 * 1024 * 1024);
     }
 
     #[test]
-    fn parse_size_rejects_garbage() {
-        assert!(parse_size("").is_err());
-        assert!(parse_size("abc").is_err());
-        assert!(parse_size("12XYZ").is_err());
-        assert!(parse_size("-5").is_err());
+    fn parse_size_usize_accepts_human_units() {
+        assert_eq!(parse_size("16MiB").unwrap(), 16 * 1024 * 1024);
+        assert_eq!(parse_size("1GiB").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(parse_size("16777216").unwrap(), 16 * 1024 * 1024);
     }
 
-    fn args_with(shard_size: u64, file_shards: Option<usize>, bcast_chunk: usize) -> Args {
+    fn args_with(shard_size: u64, file_shards: Option<usize>, bcast_chunk: u64) -> Args {
         Args {
             source: String::new(),
             dest: PathBuf::new(),

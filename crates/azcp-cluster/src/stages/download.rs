@@ -47,7 +47,7 @@ pub fn run(
     let retry_stats = client.retry_stats();
 
     let config = TransferConfig {
-        block_size: args.block_size as u64,
+        block_size: args.block_size,
         concurrency: args.concurrency,
         parallel_files: args.parallel_files,
         dry_run: false,

@@ -120,7 +120,12 @@ pub fn run(
     presence: &Presence,
 ) -> Result<()> {
     let rank = world.rank() as usize;
-    let chunk: usize = args.bcast_chunk;
+    let chunk: usize = usize::try_from(args.bcast_chunk).map_err(|_| {
+        anyhow!(
+            "--bcast-chunk {} exceeds usize on this platform",
+            args.bcast_chunk
+        )
+    })?;
     let depth: usize = args.bcast_pipeline.max(1);
     let num_writers: usize = args.bcast_writers.max(1);
     let direct: bool = !args.no_bcast_direct;
