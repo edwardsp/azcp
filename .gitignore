@@ -1,3 +1,8 @@
 /target
 /.sisyphus
 
+# Local benchmark artifacts and internal scratch files (kept out of the repo)
+/bench/
+/azcp-cluster-1tb-6file-sweep.md
+/docs/azcp-cluster-1tb-6file-sweep.md
+/launch-init-container-download-then-train.sh

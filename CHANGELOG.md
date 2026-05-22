@@ -5,6 +5,31 @@ All notable changes to `azcp` and `azcp-cluster` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.4.3] — 2026-05
+
+Bug fix: `azcp-cluster --block-size` and `--bcast-chunk` now accept
+human-readable size units (`16MiB`, `1GiB`, `1GB`, etc.) — same parser
+as `--shard-size`. Before this release both flags were silently
+declared as plain integers without a `value_parser`, so the canonical
+invocations documented in the v0.4.2 throttling guide
+(`--block-size 16MiB --bcast-chunk 1GiB`) were rejected with
+"invalid digit found in string", forcing users to compute and pass raw
+byte counts. The bug had been present since v0.2.0 and only surfaced
+because v0.4.2 was the first release whose docs recommended the
+human-readable form.
+
+Both fields are now `u64` end-to-end (matching `--shard-size`), which
+also adds defense-in-depth against the i32-truncation class of bug
+fixed in v0.3.1 (`d38acad`, silent `MPI_Ibcast` count overflow on
+`--bcast-chunk ≥ 2GiB`): the source type is wide enough across the
+entire pipeline that a future narrow-int cast cannot silently alias a
+chunk size. `usize::try_from` at the single in-memory use site
+(`broadcast.rs:123`) surfaces any 32-bit overflow with a clear error
+instead of silent truncation. End-to-end CLI smoke test locks in that
+the documented invocation form parses.
+
+New images: `ghcr.io/edwardsp/azcp/azcp-cluster:v0.4.3` and `:latest`.
+
 ## [v0.4.2] — 2026-05
 
 Operational visibility for `azcp-cluster` retries: live per-rank counters
