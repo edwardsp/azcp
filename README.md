@@ -95,6 +95,10 @@ All commands accept standard blob URLs of the form:
 https://<account>.blob.core.windows.net/<container>/<path>
 ```
 
+> **Full option reference:** [docs/options.md](docs/options.md) lists every flag
+> across `azcp` and `azcp-cluster` in one four-column table (option, applies to
+> `azcp`, applies to `azcp-cluster`, description).
+
 ### copy
 
 ```bash
@@ -113,7 +117,8 @@ azcp copy ./src https://acct.blob.core.windows.net/ctr/backup/ \
   --recursive --include-pattern '*.rs' --exclude-pattern 'target/*'
 ```
 
-Flags: `--recursive`, `--no-overwrite`, `--block-size`, `--concurrency`, `--parallel-files`, `--workers`, `--shard`, `--shardlist`, `--max-retries`, `--max-bandwidth`, `--dry-run`, `--check-md5`, `--include-pattern`, `--exclude-pattern`, `--progress`, `--no-progress`.
+Flags: `--recursive`, `--no-overwrite`, `--block-size`, `--concurrency`, `--parallel-files`, `--workers`, `--shard`, `--shardlist`, `--max-retries`, `--max-bandwidth`, `--dry-run`, `--check-md5`, `--include-pattern`, `--exclude-pattern`, `--progress`, `--no-progress`. See
+[docs/options.md](docs/options.md) for the full, cross-binary option reference.
 
 > Progress display is **on by default when stderr is a TTY** and silenced
 > automatically when output is redirected (logs, CI, `kubectl logs`). Pass
