@@ -47,7 +47,7 @@ fn main() -> ExitCode {
     if shared_size > 1 {
         eprintln!(
             "rank {rank}: detected {shared_size} ranks on this node; \
-             azcp-cluster requires more than one rank per node \
+             azcp-cluster requires exactly one rank per node \
              (use mpirun -N 1 / one process per host)"
         );
         unsafe { ffi::MPI_Abort(world.as_raw(), 2) };
