@@ -19,7 +19,7 @@ three throughput ceilings you hit on real workloads:
 
 The CLI surface is intentionally close to `azcopy` so muscle-memory carries
 over: `azcp copy`, `azcp sync`, `azcp ls`, `azcp rm`, `azcp mk`. The
-internals are different — Rust, single static binary per platform,
+internals are different — Rust, single CLI executable per platform,
 deterministic LPT sharding for parallelism that composes across processes
 and nodes.
 
@@ -44,14 +44,39 @@ Download the archive for your platform from the [latest release](../../releases/
 
 | Platform | Target |
 |---|---|
-| Linux x86_64 | `azcp-x86_64-unknown-linux-gnu.tar.gz` |
-| Linux arm64 | `azcp-aarch64-unknown-linux-gnu.tar.gz` |
+| Linux x86_64 (GNU/glibc) | `azcp-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux arm64 (GNU/glibc) | `azcp-aarch64-unknown-linux-gnu.tar.gz` |
+| Linux x86_64 (static; recommended for Azure Linux 3) | `azcp-x86_64-unknown-linux-musl.tar.gz` |
+| Linux arm64 (static; recommended for Azure Linux 3) | `azcp-aarch64-unknown-linux-musl.tar.gz` |
 | macOS Intel | `azcp-x86_64-apple-darwin.tar.gz` |
 | macOS Apple Silicon | `azcp-aarch64-apple-darwin.tar.gz` |
 | Windows x86_64 | `azcp-x86_64-pc-windows-msvc.zip` |
 | Windows arm64 | `azcp-aarch64-pc-windows-msvc.zip` |
 
-Each archive contains the `azcp` binary plus a SHA256 sidecar for verification.
+Each archive contains the `azcp` binary; a separate `.sha256` sidecar verifies
+the archive.
+
+#### Linux compatibility and dependencies
+
+**On Azure Linux 3, choose the `musl` archive matching your CPU architecture**
+(`x86_64` or `aarch64`). These CLI builds statically link their C runtime and
+have no dynamic interpreter or shared-library dependencies. You do not need
+to install musl, upgrade glibc, or copy a `libc.so.6` alongside the binary.
+
+The `gnu` builds dynamically link against the build runner's libraries.
+The v0.4.5 x86_64 GNU artifact requires glibc 2.39 and `libgcc_s.so.1`
+(plus glibc's `libm.so.6` and loader). Azure Linux 3 ships glibc 2.38, so
+that artifact fails with `GLIBC_2.39 not found`. The GNU target name does
+not promise a minimum glibc version; use the static musl build when the
+host's libraries are older than the build runner's.
+
+Static linkage does not remove all runtime requirements: a compatible Linux
+kernel, DNS/network configuration and valid storage credentials are still
+needed. HTTPS uses rustls with bundled WebPKI roots, not system OpenSSL.
+Azure CLI is needed only when using the ambient `az login` authentication
+fallback; SAS, Shared Key and managed/workload identity do not require it.
+These dependency statements apply to the default release CLI, not optional
+profiling builds or `azcp-cluster`.
 
 `azcp-cluster` is shipped **as a container only** — it links Open MPI and
 dlopens UCX/libibverbs at runtime, so a self-contained binary that works
@@ -433,7 +458,15 @@ Coverage includes: upload+rerun skip behavior, all four `--compare-method` strat
 
 ## Continuous Integration
 
-`.github/workflows/build.yml` builds all six platform targets on every push/PR using native runners (no cross-compilation). `.github/workflows/cluster-image.yml` builds and publishes the multi-arch `azcp-cluster` container to GHCR. Tag a release to publish both:
+`.github/workflows/build.yml` builds eight targets on pushes to `main`/`master`,
+version tags, pull requests and manual dispatch. Linux GNU and musl builds use
+architecture-matched runners; macOS Intel is cross-compiled on an arm64 runner.
+Both musl targets run the offline test suite, pass an ELF static-linkage check,
+and smoke-test the checksum-verified packaged CLI in the official Azure Linux 3
+container. Live-storage tests still require the credentials described above.
+Build archives are available as Actions artifacts before a release is tagged.
+`.github/workflows/cluster-image.yml` builds and publishes the multi-arch
+`azcp-cluster` container to GHCR. Tag a release to publish both:
 
 ```bash
 git tag v0.4.3
