@@ -5,6 +5,35 @@ All notable changes to `azcp` and `azcp-cluster` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.4.6] — 2026-09-29
+
+### Added
+
+- Static Linux musl binaries for x86_64 and arm64, recommended for Azure
+  Linux 3. They avoid the `GLIBC_2.39` requirement of the v0.4.5 GNU build.
+  CI checks static linkage and runs the packaged binaries in Azure Linux 3.
+  Existing GNU, macOS and Windows targets remain available. (#9, #10)
+
+### Fixed
+
+- `azcp copy --recursive` now accepts virtual directory URLs without a
+  trailing slash: a HEAD 404 falls back to listing `<path>/`. Exact blobs
+  retain precedence, nonrecursive 404s are preserved, and authentication or
+  other errors are not hidden by the fallback. (#11, #12)
+- Corrected the `azcp-cluster` one-rank-per-node diagnostic.
+
+### Documentation
+
+- Added a CLI options reference for `azcp` and `azcp-cluster`.
+- Clarified Linux runtime dependencies, static musl artifact selection, and
+  recursive directory URL resolution.
+
+### Distribution
+
+Eight CLI archives with SHA256 sidecars are published in the GitHub release.
+The existing container workflow publishes `azcp-cluster:v0.4.6` and `:latest`
+to `ghcr.io/edwardsp/azcp/azcp-cluster` for amd64 and arm64.
+
 ## [v0.4.3] — 2026-05
 
 Bug fix: `azcp-cluster --block-size` and `--bcast-chunk` now accept
