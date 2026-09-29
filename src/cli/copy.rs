@@ -12,6 +12,9 @@ use crate::storage::location::{self, BlobLocation, Location};
 
 use super::args::{resolve_progress, CopyArgs};
 
+mod source;
+use source::{resolve_source, DownloadSource};
+
 #[derive(Clone, Default)]
 pub struct SharedTransfer {
     pub progress: Option<Arc<TransferProgress>>,
@@ -186,64 +189,71 @@ async fn download(
 
     let dest_path = Path::new(dest);
 
-    if source.path.is_empty() || source.path.ends_with('/') {
-        let started = std::time::Instant::now();
-        let summary = engine
-            .download_directory(&source.account, &source.container, &source.path, dest_path)
-            .await?;
-        if shared.progress.is_none() {
-            print_summary("Download", &summary, started.elapsed());
-            print_retry_stats(engine.client());
-        }
-        check_summary(&summary)?;
-        Ok(Some(summary))
-    } else {
-        let file_name = Path::new(&source.path)
-            .file_name()
-            .map(|f| f.to_string_lossy().to_string())
-            .unwrap_or_else(|| source.path.clone());
-
-        let local_path = if dest_path.is_dir() {
-            dest_path.join(&file_name)
-        } else {
-            dest_path.to_path_buf()
-        };
-
-        let props = engine
+    let resolved = resolve_source(
+        &source.path,
+        engine
             .client()
-            .get_blob_properties(&source.account, &source.container, &source.path)
-            .await?;
+            .get_blob_properties(&source.account, &source.container, &source.path),
+        engine.config().recursive,
+    )
+    .await?;
 
-        let progress = Arc::new(TransferProgress::new(
-            1,
-            props.content_length,
-            engine.config().progress,
-        ));
-        progress.attach_retry_stats(engine.client().retry_stats());
-        let pb = progress.create_file_bar(props.content_length);
-        pb.set_message(source.path.clone());
+    match resolved {
+        DownloadSource::Directory(prefix) => {
+            let started = std::time::Instant::now();
+            let summary = engine
+                .download_directory(&source.account, &source.container, &prefix, dest_path)
+                .await?;
+            if shared.progress.is_none() {
+                print_summary("Download", &summary, started.elapsed());
+                print_retry_stats(engine.client());
+            }
+            check_summary(&summary)?;
+            Ok(Some(summary))
+        }
+        DownloadSource::Blob(props) => {
+            let file_name = Path::new(&source.path)
+                .file_name()
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_else(|| source.path.clone());
 
-        let result = engine
-            .download_file(
-                &source.account,
-                &source.container,
-                &source.path,
-                &local_path,
-                Some(props.content_length),
-                props.content_md5.as_deref(),
-                Some(&pb),
-            )
-            .await;
-        pb.finish();
-        progress.finish();
+            let local_path = if dest_path.is_dir() {
+                dest_path.join(&file_name)
+            } else {
+                dest_path.to_path_buf()
+            };
 
-        let size = result?;
-        println!(
-            "Transferred: {} ({})",
-            local_path.display(),
-            humansize::format_size(size, humansize::BINARY)
-        );
-        Ok(None)
+            let progress = Arc::new(TransferProgress::new(
+                1,
+                props.content_length,
+                engine.config().progress,
+            ));
+            progress.attach_retry_stats(engine.client().retry_stats());
+            let pb = progress.create_file_bar(props.content_length);
+            pb.set_message(source.path.clone());
+
+            let result = engine
+                .download_file(
+                    &source.account,
+                    &source.container,
+                    &source.path,
+                    &local_path,
+                    Some(props.content_length),
+                    props.content_md5.as_deref(),
+                    Some(&pb),
+                )
+                .await;
+            pb.finish();
+            progress.finish();
+
+            let size = result?;
+            println!(
+                "Transferred: {} ({})",
+                local_path.display(),
+                humansize::format_size(size, humansize::BINARY)
+            );
+            Ok(None)
+        }
     }
 }
 
