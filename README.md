@@ -145,6 +145,13 @@ azcp copy ./src https://acct.blob.core.windows.net/ctr/backup/ \
 Flags: `--recursive`, `--no-overwrite`, `--block-size`, `--concurrency`, `--parallel-files`, `--workers`, `--shard`, `--shardlist`, `--max-retries`, `--max-bandwidth`, `--dry-run`, `--check-md5`, `--include-pattern`, `--exclude-pattern`, `--progress`, `--no-progress`. See
 [docs/options.md](docs/options.md) for the full, cross-binary option reference.
 
+For recursive downloads, a virtual directory URL can end in either `dataset`
+or `dataset/`. Without the slash, azcp first checks for an exact blob; only a
+404 with `--recursive` falls back to listing `dataset/` (not `dataset-other/`).
+An existing blob still takes precedence, and authorization or other errors
+are not converted into directory listings. An empty prefix listing transfers
+zero files, just as with an explicit trailing slash.
+
 > Progress display is **on by default when stderr is a TTY** and silenced
 > automatically when output is redirected (logs, CI, `kubectl logs`). Pass
 > `--progress` to force it on (e.g. allocated PTY in CI, or `nohup` runs you
