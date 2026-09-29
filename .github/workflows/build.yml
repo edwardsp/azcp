@@ -24,6 +24,12 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
             archive: tar.gz
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+            archive: tar.gz
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            archive: tar.gz
           - target: x86_64-apple-darwin
             # Cross-compile from arm64 runner; macos-13 (Intel) runners
             # are GH-deprecated and the queue is hours-to-days long.
@@ -42,6 +48,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install musl build tools
+        if: endsWith(matrix.target, '-linux-musl')
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          target_key="${TARGET//-/_}"
+          echo "CC_${target_key}=musl-gcc" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_${target_key^^}_LINKER=musl-gcc" >> "$GITHUB_ENV"
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -59,6 +78,11 @@ jobs:
         if: matrix.target != 'aarch64-pc-windows-msvc' && matrix.target != 'x86_64-apple-darwin'
         run: cargo test --release --locked --target ${{ matrix.target }}
 
+      - name: Verify static linkage
+        if: endsWith(matrix.target, '-linux-musl')
+        shell: bash
+        run: bash tests/static_linkage.sh "target/${{ matrix.target }}/release/azcp"
+
       - name: Package (unix)
         if: matrix.archive == 'tar.gz'
         shell: bash
@@ -70,6 +94,23 @@ jobs:
           cp README.md LICENSE* "dist/$name/" 2>/dev/null || true
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           ( cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256" )
+
+      - name: Smoke-test packaged binary on Azure Linux 3
+        if: endsWith(matrix.target, '-linux-musl')
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          name="azcp-${TARGET}"
+          ( cd dist && sha256sum -c "$name.tar.gz.sha256" )
+          smoke_dir=$(mktemp -d)
+          trap 'rm -rf "$smoke_dir"' EXIT
+          tar -xzf "dist/$name.tar.gz" -C "$smoke_dir"
+          docker run --rm --network none \
+            --volume "$smoke_dir/$name:/opt/azcp:ro" \
+            mcr.microsoft.com/azurelinux/base/core:3.0 \
+            /bin/sh -ec '/opt/azcp/azcp --version; /opt/azcp/azcp --help; /opt/azcp/azcp env'
 
       - name: Package (windows)
         if: matrix.archive == 'zip'
